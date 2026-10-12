@@ -9,13 +9,19 @@ import logging
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import select
+import secrets
+from typing import Annotated
+
+from fastapi import APIRouter, Header, HTTPException, Request
+from pydantic import BaseModel
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
-from ..models import ConversationRecord, VoiceSession
+from ..models import Appointment, ConversationRecord, Patient, VoiceSession
 from ..services import sessions as session_service
+from ..services.elevenlabs import session_token_var
+from ..services.telephony import TelephonyError, from_e164_uk, to_e164
 from .deps import DbSession
 
 log = logging.getLogger(__name__)
@@ -62,6 +68,14 @@ async def store_post_call(db: AsyncSession, data: dict[str, Any]) -> Conversatio
         record.session_id = session.id
         session_service.end_session(session)
 
+    # Reminder calls: record how the call went on the appointment.
+    reminded = (
+        await db.execute(select(Appointment).where(Appointment.reminder_conversation_id == conversation_id))
+    ).scalar_one_or_none()
+    if reminded is not None:
+        succeeded = data.get("status") == "done" and analysis.get("call_successful") != "failure"
+        reminded.reminder_status = "completed" if succeeded else "failed"
+
     record.agent_id = data.get("agent_id")
     record.status = data.get("status")
     record.call_successful = analysis.get("call_successful")
@@ -95,3 +109,63 @@ async def elevenlabs_webhook(request: Request, db: DbSession) -> dict[str, Any]:
     else:
         log.info("Ignoring ElevenLabs webhook of type %s", event_type)
     return {"ok": True}
+
+
+# --- inbound phone calls ----------------------------------------------------------------------
+
+
+class CallStartIn(BaseModel):
+    """What ElevenLabs sends when a call to the clinic's number starts."""
+
+    caller_id: str | None = None
+    agent_id: str | None = None
+    called_number: str | None = None
+    call_sid: str | None = None
+    conversation_id: str | None = None
+
+
+def _caller_number(caller_id: str | None) -> str | None:
+    """Normalised caller number, or None when withheld / not a real number."""
+    if not caller_id:
+        return None
+    try:
+        return from_e164_uk(to_e164(caller_id))
+    except TelephonyError:
+        return None
+
+
+@router.post("/elevenlabs/call-start")
+async def call_start(
+    body: CallStartIn,
+    db: DbSession,
+    x_webhook_secret: Annotated[str | None, Header()] = None,
+    x_tool_secret: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    """Create a secure session for an inbound call (ElevenLabs' conversation-initiation webhook)."""
+    supplied = x_webhook_secret or x_tool_secret or ""
+    expected = get_settings().tool_secret.get_secret_value()
+    if not supplied or not secrets.compare_digest(supplied.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+
+    caller = _caller_number(body.caller_id)
+    session, token = await session_service.create_session(db, mode="voice", channel="phone")
+    session.call_sid = body.call_sid
+    session.caller_number = caller
+    session.conversation_id = body.conversation_id
+    known = False
+    if caller:
+        matches = await db.scalar(select(func.count()).select_from(Patient).where(Patient.phone == caller))
+        known = matches == 1
+    await db.commit()
+    log.info("Inbound call %s: session %s (caller known: %s)", body.call_sid, session.id, known)
+    return {
+        "type": "conversation_initiation_client_data",
+        "dynamic_variables": {
+            session_token_var(): token,
+            "channel": "phone",
+            "caller_known": "yes" if known else "no",
+            "call_purpose": "general",
+            "appointment_summary": "none",
+        },
+    }
+

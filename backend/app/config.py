@@ -96,6 +96,35 @@ class Settings(BaseSettings):
     # Gemini 3 is tuned for its default temperature (1.0); drop the agent's value.
     vertex_drop_temperature: bool = True
 
+    # --- Twilio: phone line, SMS, emergency line --------------------------------
+    # ElevenLabs answers the clinic's Twilio number itself. These settings let the
+    # backend send SMS, run SOS conference calls, transfer calls and call from the browser.
+    twilio_account_sid: str | None = None
+    # Needed to verify that webhooks really come from Twilio (and to import the number).
+    twilio_auth_token: SecretStr | None = None
+    # API key (SK...) for API calls and browser calling tokens.
+    twilio_api_key_sid: str | None = None
+    twilio_api_key_secret: SecretStr | None = None
+    # The clinic's Twilio number in E.164 format, e.g. +442079460000.
+    twilio_phone_number: str | None = None
+    # Optional data residency, e.g. region "ie1" + edge "dublin" (Ireland). Empty = Twilio default (US).
+    twilio_region: str | None = None
+    twilio_edge: str | None = None
+    # Created by `setup-agent` (kept in the state file); set here only to override.
+    twilio_twiml_app_sid: str | None = None
+    twilio_validate_signatures: bool = True
+    sms_enabled: bool = True
+    # Sender shown on SMS: an alphanumeric ID such as "HealthAI" (UK supports these) or a number.
+    sms_sender: str | None = None
+    # Where "talk to a person" calls go (E.164). Empty = offer a callback instead.
+    reception_phone_number: str | None = None
+    reminder_calls_enabled: bool = False
+    reminder_call_hour: int = 17  # clinic-local hour to start calling about tomorrow's appointments
+    reminder_call_spacing_seconds: int = 90
+    sos_ring_seconds: int = 30
+    sos_max_wait_seconds: int = 90
+    sos_starts_per_ip_per_hour: int = 3
+
     @field_validator("frontend_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: Any) -> Any:
@@ -120,6 +149,16 @@ class Settings(BaseSettings):
         "elevenlabs_api_key",
         "elevenlabs_webhook_secret",
         "elevenlabs_session_token_var",
+        "twilio_account_sid",
+        "twilio_auth_token",
+        "twilio_api_key_sid",
+        "twilio_api_key_secret",
+        "twilio_phone_number",
+        "twilio_region",
+        "twilio_edge",
+        "twilio_twiml_app_sid",
+        "sms_sender",
+        "reception_phone_number",
         mode="before",
     )
     @classmethod
@@ -144,6 +183,12 @@ class Settings(BaseSettings):
             for name in ("tool_secret", "llm_proxy_secret", "admin_token")
             if is_placeholder_secret(getattr(self, name).get_secret_value())
         ]
+
+    @property
+    def telephony_configured(self) -> bool:
+        """Enough Twilio settings to make calls and send SMS."""
+        has_credentials = bool(self.twilio_api_key_sid and self.twilio_api_key_secret) or bool(self.twilio_auth_token)
+        return bool(self.twilio_account_sid and self.twilio_phone_number and has_credentials)
 
     @property
     def asyncpg_dsn(self) -> str:

@@ -25,13 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import presenters, timeutil
 from ..config import get_settings
 from ..models import CallbackRequest, Service, VoiceSession
-from ..services import booking, patients
+from ..services import booking, emergency, handoff, patients
 from ..services import sessions as session_service
 from ..services.availability import find_slots, get_service
 from ..services.booking import BookingError, sync_appointment_calendar
 from ..services.calendar import CalendarError
 from ..services.events import publish
-from .deps import Calendar, DbSession, SessionFactory, require_tool_secret
+from ..services.notifications import send_appointment_sms
+from .deps import Calendar, DbSession, Phone, SessionFactory, require_tool_secret
 from .parsing import blank_to_none, parse_flexible_date
 
 log = logging.getLogger(__name__)
@@ -52,9 +53,11 @@ class ToolRequest(BaseModel):
 class VerifyPatientIn(ToolRequest):
     last_name: str = Field(min_length=1, max_length=80)
     date_of_birth: date
-    phone: str = Field(min_length=6, max_length=24)
+    # Optional on phone calls: the caller's own number is used when it's left empty.
+    phone: str | None = Field(default=None, max_length=24)
 
     _dob = field_validator("date_of_birth", mode="before")(parse_flexible_date)
+    _phone = field_validator("phone", mode="before")(blank_to_none)
 
 
 class RegisterPatientIn(ToolRequest):
@@ -167,6 +170,24 @@ CALENDAR_UNAVAILABLE = _error(
 )
 
 
+def _sms_will_be_sent(telephony: Phone) -> bool:
+    return telephony.enabled and get_settings().sms_enabled
+
+
+def _schedule_sms(background: BackgroundTasks, factory: SessionFactory, telephony: Phone, appointment_id: uuid.UUID, kind: str) -> None:
+    if _sms_will_be_sent(telephony):
+        background.add_task(send_appointment_sms, factory, telephony, appointment_id, kind)
+
+
+def _confirmation_note(session: VoiceSession, telephony: Phone) -> str:
+    notes = []
+    if session.channel == "web":
+        notes.append("A confirmation is shown on the patient's screen.")
+    if _sms_will_be_sent(telephony):
+        notes.append("They'll also get a text message confirming it.")
+    return " ".join(notes)
+
+
 def _schedule_calendar_sync(
     background: BackgroundTasks, factory: SessionFactory, calendar: Calendar, appointment_id: uuid.UUID
 ) -> None:
@@ -185,9 +206,13 @@ async def verify_patient(
     if session is None:
         return SESSION_INVALID
     settings = get_settings()
+    phone = body.phone or session.caller_number
+    if not phone:
+        await db.commit()
+        return _error("phone_required", "Ask for the phone number they registered with, then try again.")
     try:
         result = await patients.verify_patient(
-            db, session, last_name=body.last_name, date_of_birth=body.date_of_birth, phone=body.phone
+            db, session, last_name=body.last_name, date_of_birth=body.date_of_birth, phone=phone
         )
     except patients.PatientInputError as exc:
         await db.commit()
@@ -374,6 +399,7 @@ async def book_appointment(
     calendar: Calendar,
     factory: SessionFactory,
     background: BackgroundTasks,
+    telephony: Phone,
     x_session_token: SessionTokenHeader = None,
 ) -> dict[str, Any]:
     session = await _session(db, x_session_token, body)
@@ -411,11 +437,12 @@ async def book_appointment(
     await publish(db, session.id, "appointment_booked", {"appointment": appointment_data})
     await db.commit()
     _schedule_calendar_sync(background, factory, calendar, appointment.id)
+    _schedule_sms(background, factory, telephony, appointment.id, "booked")
 
     message = (
         "Booked. Confirm the day, date, time and clinician, then give the booking reference character by "
-        "character. Mention any preparation advice. A confirmation is shown on the patient's screen."
-    )
+        f"character. Mention any preparation advice. {_confirmation_note(session, telephony)}"
+    ).strip()
     if patients.is_minor(appointment.patient):
         message += " The patient is under 16, so remind them a parent or guardian must attend."
     return {"ok": True, "appointment": appointment_data, "message": message}
@@ -453,6 +480,7 @@ async def reschedule_appointment(
     calendar: Calendar,
     factory: SessionFactory,
     background: BackgroundTasks,
+    telephony: Phone,
     x_session_token: SessionTokenHeader = None,
 ) -> dict[str, Any]:
     session = await _session(db, x_session_token, body)
@@ -494,11 +522,15 @@ async def reschedule_appointment(
     await publish(db, session.id, "appointment_rescheduled", {"appointment": appointment_data, "previous": previous})
     await db.commit()
     _schedule_calendar_sync(background, factory, calendar, result.appointment.id)
+    _schedule_sms(background, factory, telephony, result.appointment.id, "rescheduled")
     return {
         "ok": True,
         "appointment": appointment_data,
         "previous": previous,
-        "message": "Rescheduled. Confirm the new day, date, time and clinician. The booking reference is unchanged.",
+        "message": (
+            "Rescheduled. Confirm the new day, date, time and clinician. The booking reference is unchanged. "
+            f"{_confirmation_note(session, telephony)}"
+        ).strip(),
     }
 
 
@@ -509,6 +541,7 @@ async def cancel_appointment(
     calendar: Calendar,
     factory: SessionFactory,
     background: BackgroundTasks,
+    telephony: Phone,
     x_session_token: SessionTokenHeader = None,
 ) -> dict[str, Any]:
     settings = get_settings()
@@ -531,6 +564,7 @@ async def cancel_appointment(
     )
     await db.commit()
     _schedule_calendar_sync(background, factory, calendar, result.appointment.id)
+    _schedule_sms(background, factory, telephony, result.appointment.id, "cancelled")
     message = "Cancelled. Confirm the cancellation and ask whether they'd like to book another time."
     if result.late_cancellation:
         message += (
@@ -581,3 +615,93 @@ async def request_callback(
         "message": "Callback request logged. Tell the patient a member of the team will call them back, usually "
         "within one working day.",
     }
+
+
+class StartEmergencyCallIn(ToolRequest):
+    reason: str | None = Field(default=None, max_length=300)
+
+    _blank = field_validator("reason", mode="before")(blank_to_none)
+
+
+EMERGENCY_FALLBACK = (
+    "No doctor can be reached through the emergency line right now. Tell the patient clearly: if this is "
+    "life-threatening, hang up and call 999 now; for urgent medical help that isn't life-threatening, call NHS 111."
+)
+
+
+@router.post("/start_emergency_call")
+async def start_emergency_call(
+    body: StartEmergencyCallIn,
+    db: DbSession,
+    factory: SessionFactory,
+    telephony: Phone,
+    x_session_token: SessionTokenHeader = None,
+) -> dict[str, Any]:
+    """SOS: call every available doctor and connect them with the patient; the AI leaves the call."""
+    session = await _session(db, x_session_token, body)
+    if session is None:
+        return _error("session_invalid", EMERGENCY_FALLBACK)
+    channel = "phone" if session.channel == "phone" else "web"
+    try:
+        incident = await emergency.start_incident(db, telephony, session=session, channel=channel, reason=body.reason or "")
+    except emergency.EmergencyUnavailable as exc:
+        await db.commit()
+        log.warning("Emergency line unavailable (%s) for session %s", exc.code, session.id)
+        return _error(exc.code, EMERGENCY_FALLBACK)
+    await db.commit()
+    emergency.spawn(
+        emergency.launch(factory, telephony, incident.id, patient_call_sid=session.call_sid if channel == "phone" else None)
+    )
+    # The prompt has Sophie say the 999 line before calling this tool; don't make her repeat it.
+    if channel == "phone":
+        sentence = "I'm connecting you to our doctors right now. If this is life-threatening, hang up and call 999."
+        handover = "The call will then be transferred to the doctors."
+    else:
+        sentence = "I'm connecting you to our doctors right now. If this is life-threatening, call 999."
+        handover = "The patient's screen will then join the call with the doctors."
+    message = (
+        f"The doctors are being called. If you haven't said it yet, say only: '{sentence}' "
+        f"Otherwise say only: 'Please stay on the line.' Then stop talking. {handover}"
+    )
+    return {"ok": True, "incident_id": str(incident.id), "doctors_called": len(incident.calls), "message": message}
+
+
+class ConnectToReceptionIn(ToolRequest):
+    reason: str | None = Field(default=None, max_length=300)
+
+    _blank = field_validator("reason", mode="before")(blank_to_none)
+
+
+@router.post("/connect_to_reception")
+async def connect_to_reception(
+    body: ConnectToReceptionIn,
+    db: DbSession,
+    factory: SessionFactory,
+    telephony: Phone,
+    x_session_token: SessionTokenHeader = None,
+) -> dict[str, Any]:
+    """Hand the conversation to a person at reception (phone transfer, or a browser call on the web)."""
+    session = await _session(db, x_session_token, body)
+    if session is None:
+        return SESSION_INVALID
+    reason = await handoff.reception_unavailable_reason(db, telephony)
+    if reason == "closed":
+        await db.commit()
+        return _error("reception_closed", "Reception is closed right now. Offer to arrange a callback with request_callback.")
+    if reason:
+        await db.commit()
+        return _error("reception_unavailable", "Calls can't be put through right now. Offer a callback with request_callback.")
+    if session.channel == "phone":
+        await db.commit()
+        emergency.spawn(handoff.transfer_call_to_reception(factory, telephony, session.id))
+        return {
+            "ok": True,
+            "message": "Say only: 'I'll put you through to our reception team now.' Then stop talking - the call will be transferred.",
+        }
+    await publish(db, session.id, "reception_requested", {"reason": body.reason or ""})
+    await db.commit()
+    return {
+        "ok": True,
+        "message": "Say only: 'I'll connect you to our reception team now.' The patient's screen will start the call.",
+    }
+

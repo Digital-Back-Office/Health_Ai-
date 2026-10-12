@@ -400,11 +400,30 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
             + (f" (key file {settings.google_service_account_file})" if settings.google_service_account_file else " (uses your gcloud login)"),
         ),
         ("Max concurrent sessions", str(settings.max_concurrent_sessions)),
+        (
+            "Twilio phone line",
+            f"{settings.twilio_phone_number} ("
+            + ("answered by the agent" if state.get("phone_number_id") else "run setup-agent to connect it")
+            + ")"
+            if settings.telephony_configured
+            else "not set up (phone calls, SMS and the SOS line are off)",
+        ),
+        (
+            "Browser calling (SOS)",
+            "ready"
+            if settings.twilio_api_key_sid and (settings.twilio_twiml_app_sid or state.get("twiml_app_sid"))
+            else "needs TWILIO_API_KEY_SID/SECRET, then setup-agent",
+        ),
+        ("Reception number", settings.reception_phone_number or "not set (Sophie offers a callback instead)"),
+        ("SMS confirmations", "on" if settings.telephony_configured and settings.sms_enabled else "off"),
+        ("Reminder calls", f"on, from {settings.reminder_call_hour}:00" if settings.reminder_calls_enabled else "off"),
     ]
     for name, value in checks:
         print(f"  {name:<26} {value}")
     for name in settings.placeholder_secrets():
         _warn(f"{name.upper()} is still a placeholder - run: python -m app.cli rotate-secrets")
+    if settings.telephony_configured and settings.twilio_auth_token is None and settings.twilio_validate_signatures:
+        _warn("TWILIO_AUTH_TOKEN is not set: Twilio's webhooks (SOS, transfers) can't be verified and will be refused")
     return 0
 
 

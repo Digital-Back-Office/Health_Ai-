@@ -143,3 +143,81 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
             yield http
     app.dependency_overrides.clear()
+
+
+class FakeTelephony:
+    """Records what would have been sent to Twilio."""
+
+    enabled = True
+    from_number = "+442079460000"
+
+    def __init__(self) -> None:
+        self.sms: list[tuple[str, str]] = []
+        self.calls: list[dict[str, object]] = []
+        self.updates: list[tuple[str, str]] = []
+        self.hangups: list[str] = []
+        self.ended_conferences: list[str] = []
+        self.fail_sms = False
+
+    async def send_sms(self, to: str, body: str) -> str:
+        from app.services.telephony import TelephonyError, to_e164
+
+        if self.fail_sms:
+            raise TelephonyError("SMS failed")
+        self.sms.append((to_e164(to), body))
+        return f"SM{len(self.sms)}"
+
+    async def call(self, to: str, *, url: str, status_callback: str, timeout: int) -> str:
+        sid = f"CA{len(self.calls) + 1:04d}"
+        self.calls.append({"to": to, "url": url, "status_callback": status_callback, "timeout": timeout, "sid": sid})
+        return sid
+
+    async def update_call(self, call_sid: str, twiml: str) -> None:
+        self.updates.append((call_sid, twiml))
+
+    async def hang_up(self, call_sid: str) -> None:
+        self.hangups.append(call_sid)
+
+    async def end_conference(self, friendly_name: str) -> None:
+        self.ended_conferences.append(friendly_name)
+
+    def browser_token(self, identity: str, ttl: int = 900) -> str:
+        return f"token-for-{identity}"
+
+    def validate_request(self, url: str, params: dict[str, str], signature: str | None) -> bool:
+        return signature == "valid-signature"
+
+
+TWILIO_HEADERS = {"X-Twilio-Signature": "valid-signature"}
+
+
+@pytest.fixture
+async def phone(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> FakeTelephony:
+    """Swap the app's telephony for a recording fake and remove hand-over delays."""
+    from app.main import app
+    from app.services import emergency, handoff
+
+    fake = FakeTelephony()
+    monkeypatch.setattr(app.state, "telephony", fake)
+    monkeypatch.setattr(emergency, "HANDOVER_DELAY_SECONDS", 0)
+    monkeypatch.setattr(handoff, "HANDOVER_DELAY_SECONDS", 0)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+async def _cancel_background_tasks() -> AsyncIterator[None]:
+    """SOS/hand-over tasks (e.g. the 90-second watchdog) must not outlive the test that started them."""
+    yield
+    from app.services import emergency
+
+    for task in list(emergency._tasks):
+        task.cancel()
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rate limiters are per process; give every test a clean slate."""
+    from app.api import sessions as sessions_api
+
+    monkeypatch.setattr(sessions_api, "_start_limiter", None)
+    monkeypatch.setattr(sessions_api, "_sos_limiter", None)

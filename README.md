@@ -10,8 +10,9 @@ A web-based AI receptionist for a UK private clinic. Patients talk (or type) to 
 | Staff diary mirror + staff busy blocks | Google Calendar (one calendar per clinician) |
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2 (async), Alembic |
 | Frontend | React 19 + Vite, `@elevenlabs/react` |
+| Phone line, SMS, SOS calls | Twilio (the number is answered by the same ElevenLabs agent; browser calls use the Twilio Voice SDK) |
 
-The phone channel (Twilio/SIP) can be added later using the same agent, tools and backend.
+Phone calls, text confirmations, reminder calls and the **SOS emergency line** are optional; see [6. Phone calls, SMS and the SOS line](#6-phone-calls-sms-and-the-sos-line-twilio).
 
 ## Daily use: start everything
 
@@ -68,6 +69,7 @@ Key design points:
 * **Google Calendar is a mirror, not the source of truth.** Bookings commit to Postgres first. The calendar event is then written after the tool has already answered, so the agent isn't slowed down. Writes are idempotent (the event id comes from the appointment id), serialised per appointment, and retried every minute if Google is unavailable. Staff "busy" blocks in Google Calendar (leave, meetings) are removed from availability. If a calendar can't be read, the system fails closed and offers a callback.
 * **Gemini 3 tool calling through the proxy:** Gemini 3 rejects tool-call history that's missing its "thought signatures". The proxy remembers them and puts them back on the next turn.
 * **Live UI:** tool results are published with Postgres `NOTIFY` in the same transaction, so the patient's screen shows slots, confirmations and appointments as they happen, across any number of backend workers.
+* **Phone calls use the same agent and tools.** ElevenLabs answers the Twilio number and calls our call-start webhook, which creates a session for the call exactly like a browser session. SOS and transfers are handled by the backend through Twilio (a conference for SOS, `<Dial>` for reception), so the AI is never on those calls.
 
 ---
 
@@ -84,11 +86,13 @@ HealthCare-Ai/
 │   │   ├── api/
 │   │   │   ├── tools.py          ← the agent's tools (webhooks)
 │   │   │   ├── sessions.py       browser sessions, SSE events, heartbeat
-│   │   │   ├── webhooks.py       ElevenLabs post-call webhook (HMAC)
+│   │   │   ├── webhooks.py       ElevenLabs post-call + call-start webhooks
+│   │   │   ├── twilio_webhooks.py  Twilio callbacks: SOS conference, transfers, browser calls
 │   │   │   ├── admin.py          staff dashboard API
 │   │   │   └── clinic.py         public clinic info
 │   │   ├── llm/vertex_proxy.py   OpenAI-compatible proxy → Vertex AI
-│   │   ├── services/             availability, booking, patients, calendar, events, sessions
+│   │   ├── services/             availability, booking, patients, calendar, events, sessions,
+│   │   │                         telephony, emergency (SOS), handoff, notifications (SMS), reminders
 │   │   ├── agent/
 │   │   │   ├── system_prompt.md  Sophie's prompt (UK English, guardrails, 999/111)
 │   │   │   ├── knowledge_base/   clinic info, policies, preparation, FAQ
@@ -96,12 +100,14 @@ HealthCare-Ai/
 │   │   ├── seed.py               sample clinic + synthetic test patients
 │   │   └── cli.py                python -m app.cli <command>
 │   ├── alembic/                  migrations
-│   └── tests/                    72 tests (real Postgres)
+│   └── tests/                    127 tests (real Postgres)
 └── frontend/
     └── src/
         ├── App.tsx               patient page, staff dashboard (#/staff), dev preview (#/preview)
         ├── lib/useReceptionist.ts  session → ElevenLabs → transcript/events/heartbeat
-        └── components/           AssistantCard, VoiceOrb, VisitPanel, ClinicCard, StaffDashboard
+        ├── lib/useHumanCall.ts   SOS / reception calls from the browser (Twilio Voice SDK)
+        └── components/           AssistantCard, HumanCall (SOS), VoiceOrb, VisitPanel, ClinicCard,
+                                  StaffDashboard, StaffOnCall
 ```
 
 ---
@@ -222,6 +228,63 @@ To link a specific existing calendar by hand, use `python -m app.cli link-calend
 
 What staff see: bookings appear as `Private GP consultation - A. Testington (7K3P9Q)`, with no clinical details. Any event the clinician adds (leave, meetings, lunch) blocks those times for booking. Changes must be made through the assistant or the database; edits in Google Calendar aren't synced back.
 
+## 6. Phone calls, SMS and the SOS line (Twilio)
+
+All of this is optional. Without the `TWILIO_*` settings the web app works as before: phone features are off and the SOS button only offers 999.
+
+| Feature | How it works |
+|---|---|
+| **Inbound calls** | The clinic's Twilio number is answered by Sophie (same agent, tools and backend). A call-start webhook creates a session for each call. If the caller's number belongs to a patient, Sophie only needs their surname and date of birth. |
+| **Transfer to a person** | "Can I speak to someone?" puts the call through to `RECEPTION_PHONE_NUMBER` during opening hours. On the website, the browser calls reception instead. Outside hours, or if nobody answers, a callback request is logged for staff. |
+| **Text confirmations** | An SMS after every booking, reschedule and cancellation (recorded against the appointment). |
+| **Reminder calls** | From `REMINDER_CALL_HOUR` (17:00 by default) Sophie rings patients about tomorrow's appointment; they can confirm, reschedule or cancel. Staff can also ring one now from the dashboard. Off by default (`REMINDER_CALLS_ENABLED`). |
+| **SOS emergency line** | The patient presses **SOS** on the website, or tells Sophie it's an emergency (website or phone). Every clinician switched to *on call* is rung at the same time. Each hears who needs help and presses 1 to join. Everyone who joins is on one call with the patient, and Sophie leaves the call. If nobody joins within `SOS_MAX_WAIT_SECONDS` (90 s), the patient is told to call 999. |
+
+> **Safety:** the system never dials 999 itself. Patients are told to call 999 for anything life-threatening on the SOS button, in Sophie's replies and on every SOS screen. The SOS line is an extra route to the clinic's own doctors, not an emergency service.
+
+### Set-up
+
+1. Create a **Twilio account** at https://console.twilio.com (a trial is fine for testing; see the limits below).
+2. **Buy a UK number** with Voice and SMS (*Phone Numbers → Buy a number*). UK numbers need a regulatory bundle (proof of address), which can take a few days to approve.
+3. Create an **API key**: *Account → API keys & tokens → Create API key* (Standard). Copy its SID (`SK…`) and secret.
+4. Fill in `backend/.env`:
+   ```
+   TWILIO_ACCOUNT_SID=AC...
+   TWILIO_AUTH_TOKEN=...            # also used to check that webhooks really come from Twilio
+   TWILIO_API_KEY_SID=SK...
+   TWILIO_API_KEY_SECRET=...
+   TWILIO_PHONE_NUMBER=+44...
+   RECEPTION_PHONE_NUMBER=+44...    # optional
+   ```
+5. Restart with `dev.cmd`. Its `setup-agent` run now also:
+   * connects the number to Sophie in ElevenLabs, so ElevenLabs answers it
+   * points the call-start webhook at this backend
+   * creates the TwiML app the browser uses for SOS and reception calls
+
+   Check the result with `python -m app.cli doctor`.
+6. In the **staff dashboard → On call & phone**, add each doctor's mobile number and switch on who is on call for SOS.
+7. Optional: `REMINDER_CALLS_ENABLED=true` for reminder calls, and `SMS_SENDER=HealthAI` to text from a name rather than the number.
+
+### Test it
+
+* **Inbound call:** ring the clinic number and book an appointment. Calling from a number that belongs to a test patient skips the phone-number check.
+* **SOS from the website:** put your own mobile in the On call tab, then press **SOS → Call our doctors now**. Your mobile rings; press 1 and you're on a call with the browser.
+* **SOS by voice:** tell Sophie "this is an emergency, I need a doctor", on the website or on the phone.
+* **Reception:** set `RECEPTION_PHONE_NUMBER` to your mobile and ask Sophie to speak to someone during opening hours.
+* **Reminder call:** book an appointment for tomorrow, then press *Call now* in the staff dashboard's List tab.
+
+### Trial account limits
+
+* Calls and texts only reach **verified numbers** (*Phone Numbers → Verified Caller IDs*). Verify every doctor's and tester's mobile.
+* Calls start with a short Twilio trial message. On outgoing calls the doctor presses a key first, then hears the SOS prompt and presses 1.
+* Add credit (upgrade) before using it with real people.
+
+### Notes
+
+* Twilio calls this backend at `PUBLIC_BASE_URL/twilio/...`, so the tunnel must be running. With a free static ngrok domain (`NGROK_DOMAIN`) nothing needs re-pointing.
+* Optional data residency: `TWILIO_REGION=ie1` with `TWILIO_EDGE=dublin` (Twilio Regional, Ireland; it must be enabled on your account).
+* Costs: an SOS call rings every on-call doctor's mobile at once (UK mobile minutes each), plus the patient's leg.
+
 ---
 
 ## The agent's tools
@@ -236,7 +299,9 @@ What staff see: bookings appear as `Private GP consultation - A. Testington (7K3
 | `reschedule_appointment` | moves an appointment (same reference) |
 | `cancel_appointment` | cancels; flags late cancellations (< 24 h) |
 | `request_callback` | logs a callback for staff (prescriptions, results, complaints, anything else) |
-| `end_call`, `skip_turn` | ElevenLabs system tools |
+| `start_emergency_call` | SOS: rings every on-call doctor at once and puts the patient on a call with them (Sophie leaves); the patient is always told to call 999 if it's life-threatening |
+| `connect_to_reception` | puts the patient through to reception (phone transfer or browser call), or offers a callback when closed |
+| `end_call`, `skip_turn`, `voicemail_detection` | ElevenLabs system tools |
 
 Every tool returns `{"ok": true|false, ...}` plus a `message` telling the agent what to do next. Dates come back both as ISO values (to pass back into other tools) and as spoken text ("Tuesday 14th October at 2:30pm").
 
@@ -248,7 +313,7 @@ cd backend; .venv\Scripts\activate
 pytest
 ```
 
-72 tests run against real Postgres (database `healthcare_test`). They cover:
+127 tests run against real Postgres (database `healthcare_test`). They cover:
 * availability rules, including the BST→GMT change
 * concurrent double-booking races
 * reschedule and cancel rules
@@ -259,6 +324,7 @@ pytest
 * the Vertex proxy (streaming, thought signatures, retries)
 * webhook signatures
 * the agent configuration builder
+* telephony with a fake Twilio: SOS (all doctors rung, press 1 to join, 999 fallback, patient hangs up), inbound calls, transfers, SMS, reminder calls and Twilio signatures
 
 Frontend: `npm run typecheck` and `npm run build`.
 
@@ -288,10 +354,13 @@ This is a prototype. **Use synthetic data only** until the following are in plac
 | "All of our virtual receptionists are busy" | You've hit `MAX_CONCURRENT_SESSIONS` (your plan's concurrency). |
 | Calendar badge shows `failed` on the staff dashboard | Check sharing/permissions with `python -m app.cli check-calendar`; failed syncs retry automatically every minute. |
 | `setup-agent` reports HTTP 422 | The ElevenLabs API rejected a field. The full error is printed; the agent config lives in `app/agent/setup.py`. |
+| The SOS button only offers 999 | Twilio isn't set up, or nobody is on call. See *On call & phone* in the staff dashboard and `python -m app.cli doctor`. |
+| Twilio webhooks get 403 | `TWILIO_AUTH_TOKEN` is missing or wrong, or `PUBLIC_BASE_URL` isn't the URL Twilio called (restart `dev.cmd`). |
+| SOS or reception call from the browser doesn't connect | Set `TWILIO_API_KEY_SID`/`TWILIO_API_KEY_SECRET` and run `setup-agent` (it creates the TwiML app). Allow the microphone. |
 
 ## Next steps
 
-* **Telephony:** connect a Twilio number or SIP trunk to the same agent. Use the conversation-initiation webhook to create the session and pass `secret__session_token` per call.
-* **SMS/email confirmations and reminders** (the booking flow already returns everything needed).
+* **Existing clinic phone system:** connect it to the same agent over a SIP trunk instead of a Twilio number.
+* **Email confirmations** and text reminders (SMS confirmations and reminder calls are done).
 * **Staff SSO** for the dashboard, and syncing changes made in Google Calendar back into Postgres.
 * **Real practice-management system:** swap the scheduling backend behind the same tool API.

@@ -3,11 +3,13 @@
  * sample data, so the interface can be reviewed without using ElevenLabs minutes.
  * Not included in production builds.
  */
-import { useReducer } from "react";
+import { useReducer, useState } from "react";
 import type { Appointment, ClinicInfo, SessionEvent, Slot } from "../lib/types";
+import type { HumanCall, HumanCallState } from "../lib/useHumanCall";
 import { initialVisit, visitReducer } from "../lib/visit";
 import { Footer, Header } from "./Chrome";
 import { ClinicCard } from "./ClinicCard";
+import { HumanCallPanel, SosSheet } from "./HumanCall";
 import { VisitPanel } from "./VisitPanel";
 
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -93,30 +95,103 @@ const SCRIPT: SessionEvent[] = [
   { type: "callback_requested", data: { preferred_time: "Tomorrow morning" } },
 ];
 
+const DOCTORS = (patel: string, whitfield: string) => [
+  { name: "Dr James Whitfield", status: whitfield },
+  { name: "Dr Sarah Patel", status: patel },
+];
+
+// Calls with people (SOS doctors / reception), without Twilio.
+const CALLS: Record<string, Partial<HumanCallState>> = {
+  "sos starting": { kind: "sos", phase: "starting" },
+  "sos ringing": { kind: "sos", phase: "ringing", doctors: DOCTORS("ringing", "ringing") },
+  "sos connected": { kind: "sos", phase: "connected", doctors: DOCTORS("joined", "declined") },
+  "sos unanswered": { kind: "sos", phase: "unanswered", doctors: DOCTORS("no-answer", "no-answer") },
+  "sos error": {
+    kind: "sos",
+    phase: "error",
+    error: "Our emergency line can't reach a doctor right now. If this is life-threatening, call 999 now.",
+  },
+  "sos ended": { kind: "sos", phase: "ended", doctors: DOCTORS("left", "declined") },
+  "reception call": { kind: "reception", phase: "connected" },
+};
+
+function fakeCall(state: Partial<HumanCallState>, reset: () => void): HumanCall {
+  const noop = async () => {};
+  return {
+    kind: null,
+    phase: "idle",
+    doctors: [],
+    muted: false,
+    since: state.phase === "starting" ? null : Date.now() - 42_000,
+    error: null,
+    ...state,
+    startSos: noop,
+    joinSos: noop,
+    callReception: noop,
+    hangUp: reset,
+    reset,
+    toggleMute: () => {},
+  };
+}
+
 export default function Preview({ clinic }: { clinic: ClinicInfo | null }) {
   const [visit, dispatch] = useReducer(visitReducer, initialVisit);
+  const [call, setCall] = useState<string | null>(null);
+  const [sheet, setSheet] = useState<"line" | "no-line" | null>(null);
   return (
     <>
       <Header clinic={clinic} />
       <main className="shell page">
-        <section className="card">
-          <div className="card__header">
-            <h1 className="card__title">UI preview (development only)</h1>
-          </div>
-          <div className="card__body" style={{ display: "grid", gap: 10 }}>
-            <p className="muted">Replay the live events the backend sends during a conversation.</p>
-            <div className="suggestions" style={{ justifyContent: "flex-start" }}>
-              <button className="chip" type="button" onClick={() => dispatch({ type: "reset" })}>
-                Reset
-              </button>
-              {SCRIPT.map((event, index) => (
-                <button key={index} className="chip" type="button" onClick={() => dispatch(event)}>
-                  {event.type.replace(/_/g, " ")}
-                </button>
-              ))}
+        <div className="stack">
+          <section className="card">
+            <div className="card__header">
+              <h1 className="card__title">UI preview (development only)</h1>
             </div>
-          </div>
-        </section>
+            <div className="card__body" style={{ display: "grid", gap: 10 }}>
+              <p className="muted">Replay the live events the backend sends during a conversation.</p>
+              <div className="suggestions" style={{ justifyContent: "flex-start" }}>
+                <button className="chip" type="button" onClick={() => dispatch({ type: "reset" })}>
+                  Reset
+                </button>
+                {SCRIPT.map((event, index) => (
+                  <button key={index} className="chip" type="button" onClick={() => dispatch(event)}>
+                    {event.type.replace(/_/g, " ")}
+                  </button>
+                ))}
+              </div>
+              <p className="muted">Calls with people (SOS / reception):</p>
+              <div className="suggestions" style={{ justifyContent: "flex-start" }}>
+                <button className="chip" type="button" onClick={() => setSheet("line")}>
+                  SOS sheet
+                </button>
+                <button className="chip" type="button" onClick={() => setSheet("no-line")}>
+                  SOS sheet (line off)
+                </button>
+                {Object.keys(CALLS).map((name) => (
+                  <button key={name} className="chip" type="button" aria-pressed={call === name} onClick={() => setCall(name)}>
+                    {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
+          {call && (
+            <section className="card assistant" style={{ minHeight: 0 }}>
+              <HumanCallPanel call={fakeCall(CALLS[call], () => setCall(null))} assistant={clinic?.assistant_name ?? "Sophie"} />
+            </section>
+          )}
+          {sheet && (
+            <SosSheet
+              assistant={clinic?.assistant_name ?? "Sophie"}
+              emergencyLine={sheet === "line"}
+              onClose={() => setSheet(null)}
+              onConfirm={() => {
+                setSheet(null);
+                setCall("sos starting");
+              }}
+            />
+          )}
+        </div>
         <div className="stack">
           <VisitPanel visit={visit} live clinic={clinic} onPickSlot={() => {}} />
           <ClinicCard clinic={clinic} />

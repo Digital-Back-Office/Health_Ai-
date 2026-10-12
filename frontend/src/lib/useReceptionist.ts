@@ -1,12 +1,24 @@
 import { useConversation } from "@elevenlabs/react";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { api } from "./api";
+import { api, type SessionAuth } from "./api";
 import { subscribeToEvents, type SseHandle } from "./sse";
-import type { SessionEvent, StartedSession, TranscriptEntry } from "./types";
+import type { SessionEvent, SosPayload, StartedSession, TranscriptEntry } from "./types";
 import { initialVisit, visitReducer } from "./visit";
 
 export type Phase = "idle" | "preparing" | "connecting" | "live" | "ended" | "error";
 export type Mode = "voice" | "text";
+
+/** Sophie is handing the patient to a person; `session` resolves once she has finished speaking. */
+export type HumanRequest =
+  | { kind: "sos"; incident: SosPayload; session: Promise<SessionAuth | null> }
+  | { kind: "reception"; session: Promise<SessionAuth | null> };
+
+export interface ReceptionistOptions {
+  onHumanRequest?: (request: HumanRequest) => void;
+}
+
+// How long to let Sophie finish her last sentence before the call is handed over.
+const HANDOVER_WAIT_MS = { sos: 7000, reception: 9000 };
 
 let entryCounter = 0;
 const newId = () => `m${Date.now().toString(36)}${(entryCounter++).toString(36)}`;
@@ -26,7 +38,7 @@ function friendlyError(message: string): string {
  * Everything the patient-facing page needs for one conversation:
  * backend session -> ElevenLabs connection -> transcript, live visit events, heartbeat.
  */
-export function useReceptionist() {
+export function useReceptionist(options: ReceptionistOptions = {}) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [mode, setMode] = useState<Mode>("voice");
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +55,12 @@ export function useReceptionist() {
   // Incremented by every start() and end(): lets an in-flight start() notice it was cancelled.
   const attemptRef = useRef(0);
   const sendRef = useRef<(text: string) => void>(() => {});
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  const speakingRef = useRef(false);
+  const agentTypingRef = useRef(false);
+  const lastAgentMessageRef = useRef(0);
+  const handOverRef = useRef<(waitMs: number) => Promise<SessionAuth | null>>(async () => null);
 
   const addEntry = useCallback((role: TranscriptEntry["role"], text: string) => {
     const trimmed = text.trim();
@@ -86,9 +104,18 @@ export function useReceptionist() {
     },
     onMessage: ({ message, role }) => {
       addEntry(role, message);
-      if (role === "agent") setAgentTyping(false);
+      if (role === "agent") {
+        lastAgentMessageRef.current = Date.now();
+        agentTypingRef.current = false;
+        setAgentTyping(false);
+      }
+    },
+    onModeChange: ({ mode }) => {
+      speakingRef.current = mode === "speaking";
     },
     onAgentChatResponsePart: (part) => {
+      if (part.type === "start") agentTypingRef.current = true;
+      if (part.type === "stop") agentTypingRef.current = false;
       if (part.type === "start") setAgentTyping(true);
       if (part.type === "stop") setAgentTyping(false);
     },
@@ -155,6 +182,16 @@ export function useReceptionist() {
       sessionRef.current = session;
       sseRef.current = subscribeToEvents(`/api/sessions/${session.session_id}/events`, session.session_token, (type, data) => {
         if (type === "ready") return;
+        const { onHumanRequest } = optionsRef.current;
+        if (type === "sos_started" && onHumanRequest) {
+          onHumanRequest({ kind: "sos", incident: data as SosPayload, session: handOverRef.current(HANDOVER_WAIT_MS.sos) });
+          return;
+        }
+        if (type === "reception_requested" && onHumanRequest) {
+          onHumanRequest({ kind: "reception", session: handOverRef.current(HANDOVER_WAIT_MS.reception) });
+          return;
+        }
+        if (type.startsWith("sos_") || type === "reception_requested") return;
         if (type === "state_changed") {
           api.state(session).then((state) => dispatch({ type: "hydrate", state })).catch(() => {});
           return;
@@ -193,6 +230,55 @@ export function useReceptionist() {
     setPhase((current) => (current === "idle" ? current : "ended"));
   }, [conversation, teardown]);
 
+  /** Resolves once Sophie has said her last sentence (or after maxMs). */
+  const agentFinished = useCallback(
+    (maxMs: number) =>
+      new Promise<void>((resolve) => {
+        const since = Date.now();
+        let quietFrom = 0;
+        const check = () => {
+          const now = Date.now();
+          if (now - since >= maxMs) return resolve();
+          const spoke = lastAgentMessageRef.current >= since;
+          if (spoke && !speakingRef.current && !agentTypingRef.current) {
+            quietFrom ||= now;
+            if (now - quietFrom >= 900) return resolve();
+          } else {
+            quietFrom = 0;
+          }
+          window.setTimeout(check, 150);
+        };
+        check();
+      }),
+    [],
+  );
+
+  /**
+   * End the AI conversation but keep the backend session: a call with people (SOS / reception)
+   * takes it over. Pass waitMs to let Sophie finish speaking first.
+   */
+  const handOver = useCallback(
+    async (waitMs = 0): Promise<SessionAuth | null> => {
+      attemptRef.current += 1; // cancels a start() still in flight
+      const session = sessionRef.current;
+      sessionRef.current = null; // the call owns the session now, so teardown won't end it
+      pendingMessageRef.current = null;
+      sseRef.current?.close();
+      sseRef.current = null;
+      if (heartbeatRef.current) window.clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+      if (session && waitMs > 0 && connectedRef.current) await agentFinished(waitMs);
+      connectedRef.current = false;
+      if (session) conversation.endSession();
+      agentTypingRef.current = false;
+      setAgentTyping(false);
+      setPhase((current) => (current === "idle" ? current : "ended"));
+      return session ? { session_id: session.session_id, session_token: session.session_token } : null;
+    },
+    [agentFinished, conversation],
+  );
+  handOverRef.current = handOver;
+
   // Clear a stale "working on it" indicator if a tool never reports back.
   useEffect(() => {
     if (!visit.activity) return;
@@ -220,6 +306,7 @@ export function useReceptionist() {
     visit,
     start,
     end,
+    handOver,
     sendText,
     isSpeaking: conversation.isSpeaking,
     isMuted: conversation.isMuted,

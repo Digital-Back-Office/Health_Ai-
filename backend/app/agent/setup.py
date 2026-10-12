@@ -20,7 +20,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from ..api.clinic import opening_hours
+from ..services.clinic_hours import opening_hours
 from ..config import Settings, get_settings
 from ..db import dispose_engine, get_sessionmaker
 from ..models import Clinician, Service
@@ -220,9 +220,12 @@ def tool_configs(
             {
                 "last_name": _string("The patient's surname, spelled as they confirmed it."),
                 "date_of_birth": _string(f"The patient's date of birth. {date_hint}"),
-                "phone": _string("The phone number the patient registered with, e.g. 07700 900123."),
+                "phone": _string(
+                    "The phone number the patient registered with, e.g. 07700 900123. Leave empty on a phone call "
+                    "when caller_known is yes (their number is already known)."
+                ),
             },
-            ["last_name", "date_of_birth", "phone"],
+            ["last_name", "date_of_birth"],
         ),
         webhook(
             "register_patient",
@@ -305,6 +308,22 @@ def tool_configs(
                 "preferred_time": _string("When they'd prefer a call, if they said. Empty otherwise."),
             },
             ["reason"],
+        ),
+        webhook(
+            "start_emergency_call",
+            "EMERGENCY: immediately connect the patient to the clinic's doctors on a live call - every available "
+            "doctor is phoned at once and joins the patient; you leave the call. Use it straight away, without "
+            "further questions, when the patient says it's an emergency, urgently asks for a doctor, or describes "
+            "emergency symptoms.",
+            {"reason": _string("A few words on what's happening, e.g. 'chest pain, short of breath'. Empty if unknown.")},
+            [],
+            timeout=10,
+        ),
+        webhook(
+            "connect_to_reception",
+            "Put the patient through to a person at reception - when they ask to speak to someone, or you can't help.",
+            {"reason": _string("Briefly, why they want to speak to someone. Empty if not given.")},
+            [],
         ),
     ]
 
@@ -407,12 +426,17 @@ def agent_payload(
     llm_secret_id: str,
     voice_id: str,
     token_var: str,
+    tool_secret_id: str | None = None,
+    plain_webhook_header: bool = False,
 ) -> dict[str, Any]:
+    from ..services.reminders import voicemail_message
+
+    telephony = settings.telephony_configured
     surnames = sorted({c.full_name.split()[-1] for c in clinic.clinicians})
     keywords = [*settings.clinic_name.split()[:1], *surnames, "physiotherapy", "phlebotomy", "GP", "mobile"]
     return {
         "name": f"{settings.clinic_name} - AI receptionist",
-        "tags": ["healthcare", "uk", "receptionist", "web"],
+        "tags": ["healthcare", "uk", "receptionist", "web", *(["phone"] if telephony else [])],
         "conversation_config": {
             "agent": {
                 "first_message": (
@@ -420,7 +444,15 @@ def agent_payload(
                     "AI assistant. How can I help you today?"
                 ),
                 "language": "en",
-                "dynamic_variables": {"dynamic_variable_placeholders": {token_var: "dashboard-preview", "channel": "web"}},
+                "dynamic_variables": {
+                    "dynamic_variable_placeholders": {
+                        token_var: "dashboard-preview",
+                        "channel": "web",
+                        "caller_known": "no",
+                        "call_purpose": "general",
+                        "appointment_summary": "none",
+                    }
+                },
                 "prompt": {
                     "prompt": prompt,
                     "llm": "custom-llm",
@@ -431,7 +463,14 @@ def agent_payload(
                     },
                     "temperature": 0.3,
                     "tool_ids": tool_ids,
-                    "built_in_tools": {"end_call": _system_tool("end_call"), "skip_turn": _system_tool("skip_turn")},
+                    "built_in_tools": {
+                        "end_call": _system_tool("end_call"),
+                        "skip_turn": _system_tool("skip_turn"),
+                        "voicemail_detection": {
+                            **_system_tool("voicemail_detection"),
+                            "params": {"system_tool_type": "voicemail_detection", "voicemail_message": voicemail_message()},
+                        },
+                    },
                     "knowledge_base": documents,
                     "timezone": settings.clinic_timezone,
                 },
@@ -449,7 +488,27 @@ def agent_payload(
         },
         "platform_settings": {
             "auth": {"enable_auth": True},
-            "overrides": {"conversation_config_override": {"conversation": {"text_only": True}}},
+            "overrides": {
+                # text_only: the web chat mode; first_message: personalised openings for reminder calls.
+                "conversation_config_override": {"conversation": {"text_only": True}, "agent": {"first_message": True}},
+                **({"enable_conversation_initiation_client_data_from_webhook": True} if telephony else {}),
+            },
+            **(
+                {
+                    "workspace_overrides": {
+                        "conversation_initiation_client_data_webhook": {
+                            "url": f"{settings.public_base_url}/webhooks/elevenlabs/call-start",
+                            "request_headers": {
+                                "X-Webhook-Secret": settings.tool_secret.get_secret_value()
+                                if plain_webhook_header or not tool_secret_id
+                                else {"secret_id": tool_secret_id}
+                            },
+                        }
+                    }
+                }
+                if telephony
+                else {}
+            ),
             "evaluation": {
                 "criteria": [
                     {
@@ -499,6 +558,70 @@ def agent_payload(
             "privacy": {"record_voice": False, "retention_days": 30},
         },
     }
+
+
+def _save_agent(api: ElevenLabsAdmin, payload: dict[str, Any], agent_id: str | None, log: Callable[[str], None]) -> str:
+    if agent_id and api.call("PATCH", f"/v1/convai/agents/{agent_id}", json=payload, allow_404=True) is not None:
+        log(f"Updated agent {agent_id}.")
+        return agent_id
+    new_id: str = api.call("POST", "/v1/convai/agents/create", json=payload)["agent_id"]
+    log(f"Created agent {new_id}.")
+    return new_id
+
+
+def setup_phone_line(
+    api: ElevenLabsAdmin, settings: Settings, state: dict[str, Any], agent_id: str, log: Callable[[str], None]
+) -> None:
+    """Browser-calling TwiML app (Twilio) + the clinic's number connected to the agent (ElevenLabs)."""
+    from ..services.telephony import TwilioTelephony, to_e164
+
+    twilio = TwilioTelephony(settings, state.get("twiml_app_sid"))
+    if settings.twilio_api_key_sid and settings.twilio_api_key_secret:
+        try:
+            voice_url = f"{settings.public_base_url}/twilio/voice/client"
+            state["twiml_app_sid"] = twilio.ensure_twiml_app(voice_url, state.get("twiml_app_sid"))
+            log(f"  Browser calling ready (TwiML app {state['twiml_app_sid']}).")
+        except Exception as exc:  # Twilio errors are reported, not fatal
+            log(f"  (could not set up browser calling: {exc})")
+    else:
+        log("  Browser calling (web SOS / reception) needs TWILIO_API_KEY_SID and TWILIO_API_KEY_SECRET - skipped.")
+
+    if settings.twilio_auth_token is None:
+        log("  Set TWILIO_AUTH_TOKEN to connect the number to the agent - skipped.")
+        return
+    number = to_e164(settings.twilio_phone_number or "")
+    listing = api.call("GET", "/v1/convai/phone-numbers")
+    numbers = listing if isinstance(listing, list) else listing.get("phone_numbers", [])
+    match = next((n for n in numbers if n.get("phone_number") == number), None)
+    if match:
+        phone_number_id = match["phone_number_id"]
+        assigned = (match.get("assigned_agent") or {}).get("agent_id")
+        if assigned != agent_id:
+            try:
+                api.call("PATCH", f"/v1/convai/phone-numbers/{phone_number_id}", json={"agent_id": agent_id})
+                log(f"  {number} is now answered by the agent.")
+            except ApiError as exc:
+                log(f"  (assign {number} to the agent in the ElevenLabs dashboard - HTTP {exc.status})")
+        else:
+            log(f"  {number} is answered by the agent.")
+    else:
+        auth_token = settings.twilio_auth_token.get_secret_value()
+        body: dict[str, Any] = {
+            "provider": "twilio",
+            "phone_number": number,
+            "label": f"{settings.clinic_name} line",
+            "sid": settings.twilio_account_sid,
+            "token": auth_token,
+            "agent_id": agent_id,
+        }
+        if settings.twilio_region:
+            regional = settings.twilio_api_key_secret.get_secret_value() if settings.twilio_api_key_secret else auth_token
+            body["region_config"] = {"region_id": settings.twilio_region, "token": regional}
+            if settings.twilio_edge:
+                body["region_config"]["edge_location"] = settings.twilio_edge
+        phone_number_id = api.call("POST", "/v1/convai/phone-numbers", json=body)["phone_number_id"]
+        log(f"  Connected {number} to the agent.")
+    state["phone_number_id"] = phone_number_id
 
 
 def run_setup(*, force_new_agent: bool = False, log: Callable[[str], None] = print) -> dict[str, Any]:
@@ -565,16 +688,36 @@ def run_setup(*, force_new_agent: bool = False, log: Callable[[str], None] = pri
             llm_secret_id=llm_secret_id,
             voice_id=voice_id,
             token_var=state["session_token_var"],
+            tool_secret_id=tool_secret_id,
         )
 
         agent_id = None if force_new_agent else (settings.elevenlabs_agent_id or state.get("agent_id"))
-        if agent_id and api.call("PATCH", f"/v1/convai/agents/{agent_id}", json=payload, allow_404=True) is not None:
-            log(f"Updated agent {agent_id}.")
-        else:
-            agent_id = api.call("POST", "/v1/convai/agents/create", json=payload)["agent_id"]
-            log(f"Created agent {agent_id}.")
+        try:
+            agent_id = _save_agent(api, payload, agent_id, log)
+        except ApiError as exc:
+            if not (settings.telephony_configured and exc.status == 422 and "request_headers" in exc.body):
+                raise
+            log("  ElevenLabs wants a plain header value for the call-start webhook - retrying.")
+            payload = agent_payload(
+                settings,
+                clinic,
+                prompt=build_prompt(settings, clinic),
+                tool_ids=tool_ids,
+                documents=documents,
+                llm_secret_id=llm_secret_id,
+                voice_id=voice_id,
+                token_var=state["session_token_var"],
+                tool_secret_id=tool_secret_id,
+                plain_webhook_header=True,
+            )
+            agent_id = _save_agent(api, payload, agent_id, log)
         state["agent_id"] = agent_id
         save_state(state)
+
+        if settings.telephony_configured:
+            log("Phone line...")
+            setup_phone_line(api, settings, state, agent_id, log)
+            save_state(state)
 
         # Clean up anything this run replaced (best effort).
         for doc_id in stale_documents:

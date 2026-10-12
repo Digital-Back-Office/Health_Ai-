@@ -18,15 +18,20 @@ from .. import presenters, timeutil
 from ..config import get_settings
 from ..db import get_sessionmaker
 from ..llm import vertex_proxy
-from ..models import VoiceSession
+from ..models import EmergencyIncident, VoiceSession
 from ..services import booking
 from ..services import sessions as session_service
+from ..services import emergency
 from ..services.elevenlabs import ElevenLabsError, session_token_var
-from .deps import BrowserSession, DbSession, ElevenLabs, EventBus, bearer_token
+from ..services.telephony import TelephonyError
+from .deps import BrowserSession, DbSession, ElevenLabs, EventBus, Phone, SessionFactory, bearer_token
+from .twilio_webhooks import browser_identity
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+sos_router = APIRouter(prefix="/api", tags=["sessions"])
 
 _start_limiter: session_service.RateLimiter | None = None
+_sos_limiter: session_service.RateLimiter | None = None
 SESSION_CREATE_LOCK = 724_001  # advisory lock id serialising the concurrency check
 
 
@@ -35,6 +40,24 @@ def _limiter() -> session_service.RateLimiter:
     if _start_limiter is None:
         _start_limiter = session_service.RateLimiter(get_settings().session_starts_per_minute_per_ip, 60)
     return _start_limiter
+
+
+def _sos_rate_limiter() -> session_service.RateLimiter:
+    global _sos_limiter
+    if _sos_limiter is None:
+        _sos_limiter = session_service.RateLimiter(get_settings().sos_starts_per_ip_per_hour, 3600)
+    return _sos_limiter
+
+
+def base_dynamic_variables(token: str) -> dict[str, str]:
+    """Every dynamic variable the agent defines must be supplied, so web sessions send defaults too."""
+    return {
+        session_token_var(): token,
+        "channel": "web",
+        "caller_known": "no",
+        "call_purpose": "general",
+        "appointment_summary": "none",
+    }
 
 
 class StartSessionIn(BaseModel):
@@ -107,7 +130,7 @@ async def start_session(body: StartSessionIn, request: Request, db: DbSession, e
         connection_type=connection_type,
         conversation_token=conversation_token,
         signed_url=signed_url,
-        dynamic_variables={session_token_var(): token, "channel": "web"},
+        dynamic_variables=base_dynamic_variables(token),
     )
 
 
@@ -194,3 +217,115 @@ async def session_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+# --- SOS and calls to people from the browser ---------------------------------------------
+
+
+class SosIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=300)
+
+
+class VoiceTokenIn(BaseModel):
+    purpose: Literal["sos", "reception"]
+
+
+def _sos_unavailable(exc: emergency.EmergencyUnavailable) -> HTTPException:
+    detail = (
+        "Our emergency line can't reach a doctor right now. If this is life-threatening, call 999 now. "
+        "For urgent medical help, call NHS 111."
+    )
+    return HTTPException(status_code=503, detail=detail)
+
+
+async def _launch_sos(
+    db: DbSession, factory: SessionFactory, telephony: Phone, session: VoiceSession, reason: str
+) -> dict[str, Any]:
+    try:
+        incident = await emergency.start_incident(db, telephony, session=session, channel="web", reason=reason)
+    except emergency.EmergencyUnavailable as exc:
+        await db.rollback()
+        raise _sos_unavailable(exc) from exc
+    await db.commit()
+    emergency.spawn(emergency.launch(factory, telephony, incident.id))
+    return {"incident_id": str(incident.id), "doctors_called": len(incident.calls)}
+
+
+@router.post("/{session_id}/sos", status_code=201)
+async def start_sos(
+    session_id: uuid.UUID,
+    body: SosIn,
+    request: Request,
+    session: BrowserSession,
+    db: DbSession,
+    factory: SessionFactory,
+    telephony: Phone,
+) -> dict[str, Any]:
+    """The SOS button during a conversation: call every available doctor into a call with this patient."""
+    _check_owner(session, session_id)
+    if not _sos_rate_limiter().allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Please call 999 if you need emergency help.")
+    session_service.touch(session)
+    return await _launch_sos(db, factory, telephony, session, body.reason or "Pressed the SOS button")
+
+
+@sos_router.post("/sos", status_code=201)
+async def start_sos_without_conversation(
+    body: SosIn, request: Request, db: DbSession, factory: SessionFactory, telephony: Phone
+) -> dict[str, Any]:
+    """The SOS button before any conversation has started."""
+    if not _sos_rate_limiter().allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Please call 999 if you need emergency help.")
+    session, token = await session_service.create_session(db, mode="voice", channel="web", client_ip=_client_ip(request))
+    result = await _launch_sos(db, factory, telephony, session, body.reason or "Pressed the SOS button")
+    return {
+        **result,
+        "session_id": str(session.id),
+        "session_token": token,
+        "expires_at": session.expires_at.isoformat(),
+    }
+
+
+@router.post("/{session_id}/voice-token")
+async def voice_token(session_id: uuid.UUID, body: VoiceTokenIn, session: BrowserSession, db: DbSession, telephony: Phone) -> dict[str, str]:
+    """Short-lived Twilio token so the browser can join the SOS call or call reception."""
+    _check_owner(session, session_id)
+    if not telephony.enabled:
+        raise HTTPException(status_code=503, detail="Calling from the browser isn't set up.")
+    try:
+        token = telephony.browser_token(browser_identity(session.id))
+    except TelephonyError as exc:
+        raise HTTPException(status_code=503, detail="Calling from the browser isn't set up.") from exc
+    session_service.touch(session)
+    await db.commit()
+    return {
+        "token": token,
+        "identity": browser_identity(session.id),
+        "purpose": body.purpose,
+        "edge": get_settings().twilio_edge or "",
+    }
+
+
+async def _own_incident(db: DbSession, session: VoiceSession, incident_id: uuid.UUID) -> EmergencyIncident:
+    incident = await db.get(EmergencyIncident, incident_id)
+    if incident is None or incident.session_id != session.id:
+        raise HTTPException(status_code=404, detail="Emergency call not found")
+    return incident
+
+
+@router.get("/{session_id}/sos/{incident_id}")
+async def sos_status(session_id: uuid.UUID, incident_id: uuid.UUID, session: BrowserSession, db: DbSession) -> dict[str, Any]:
+    """Current state of the SOS call (who is being rung, who has joined)."""
+    _check_owner(session, session_id)
+    return emergency.incident_payload(await _own_incident(db, session, incident_id))
+
+
+@router.post("/{session_id}/sos/{incident_id}/end", status_code=204)
+async def end_sos(
+    session_id: uuid.UUID, incident_id: uuid.UUID, session: BrowserSession, db: DbSession, telephony: Phone
+) -> Response:
+    """The patient hung up (or their browser couldn't join): stop ringing the doctors."""
+    _check_owner(session, session_id)
+    await emergency.end_for_patient(db, telephony, await _own_incident(db, session, incident_id))
+    return Response(status_code=204)
+

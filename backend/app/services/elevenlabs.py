@@ -22,16 +22,16 @@ class ElevenLabsError(Exception):
         self.status_code = status_code
 
 
-def load_state(path: Path = STATE_FILE) -> dict[str, Any]:
-    """Ids written by `python -m app.cli setup-agent` (agent, tools, documents)."""
+def load_state(path: Path | None = None) -> dict[str, Any]:
+    """Ids written by `python -m app.cli setup-agent` (agent, tools, documents, phone number)."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads((path or STATE_FILE).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def save_state(state: dict[str, Any], path: Path = STATE_FILE) -> None:
-    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+def save_state(state: dict[str, Any], path: Path | None = None) -> None:
+    (path or STATE_FILE).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
 DEFAULT_SESSION_TOKEN_VAR = "secret__session_token"
@@ -79,3 +79,36 @@ class ElevenLabsClient:
         """Signed WebSocket URL (used for text-only chat); valid for 15 minutes."""
         data = await self._get("/v1/convai/conversation/get-signed-url", {"agent_id": self.agent_id})
         return data["signed_url"]
+
+    async def outbound_call(
+        self,
+        *,
+        to_number: str,
+        phone_number_id: str,
+        dynamic_variables: dict[str, str],
+        first_message: str | None = None,
+        ringing_timeout_secs: int = 40,
+    ) -> dict[str, Any]:
+        """Ring a patient from the clinic's Twilio number with this agent (reminder calls)."""
+        client_data: dict[str, Any] = {"dynamic_variables": dynamic_variables}
+        if first_message:
+            client_data["conversation_config_override"] = {"agent": {"first_message": first_message}}
+        body = {
+            "agent_id": self.agent_id,
+            "agent_phone_number_id": phone_number_id,
+            "to_number": to_number,
+            "conversation_initiation_client_data": client_data,
+            "telephony_call_config": {"ringing_timeout_secs": ringing_timeout_secs},
+        }
+        try:
+            response = await self._http.post(
+                f"{self._base_url}/v1/convai/twilio/outbound-call", json=body, headers=self._headers, timeout=20.0
+            )
+        except httpx.HTTPError as exc:
+            raise ElevenLabsError(f"Could not reach ElevenLabs: {exc}") from exc
+        if response.status_code != 200:
+            raise ElevenLabsError(f"ElevenLabs returned {response.status_code}: {response.text[:300]}", response.status_code)
+        data = response.json()
+        if not data.get("success", False):
+            raise ElevenLabsError(f"Outbound call not placed: {data.get('message')}")
+        return data

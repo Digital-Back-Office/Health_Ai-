@@ -48,6 +48,8 @@ async def test_tool_configs(db: AsyncSession) -> None:
         "reschedule_appointment",
         "cancel_appointment",
         "request_callback",
+        "start_emergency_call",
+        "connect_to_reception",
     ]
     for tool in tools:
         schema = tool["api_schema"]

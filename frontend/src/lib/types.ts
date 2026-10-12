@@ -40,6 +40,8 @@ export interface ClinicInfo {
   open_now: boolean;
   today: OpeningDay;
   opening_hours: OpeningDay[];
+  /** The SOS button can ring our doctors (otherwise it only offers 999). */
+  emergency_line: boolean;
   services: Service[];
   clinicians: Clinician[];
 }
@@ -78,6 +80,7 @@ export interface StaffAppointment extends Appointment {
   booked_via: string;
   created_at: string;
   cancellation_reason: string | null;
+  reminder_status: string | null;
 }
 
 export interface StartedSession {
@@ -109,7 +112,29 @@ export type SessionEvent =
   | { type: "appointment_cancelled"; data: { appointment: Appointment; late_cancellation: boolean } }
   | { type: "appointments_listed"; data: { appointments: Appointment[] } }
   | { type: "callback_requested"; data: { preferred_time: string | null } }
-  | { type: "state_changed"; data: Record<string, never> };
+  | { type: "state_changed"; data: Record<string, never> }
+  | { type: "sos_started" | "sos_update" | "sos_connected" | "sos_unanswered" | "sos_ended"; data: SosPayload }
+  | { type: "reception_requested"; data: { reason: string } };
+
+export interface DoctorCallStatus {
+  name: string;
+  status: string;
+}
+
+export interface SosPayload {
+  incident_id: string;
+  status: "dialling" | "connected" | "unanswered" | "ended" | "failed";
+  channel: "web" | "phone";
+  doctors: DoctorCallStatus[];
+}
+
+export interface SosStarted {
+  incident_id: string;
+  doctors_called: number;
+  session_id?: string;
+  session_token?: string;
+  expires_at?: string;
+}
 
 export interface TranscriptEntry {
   id: string;

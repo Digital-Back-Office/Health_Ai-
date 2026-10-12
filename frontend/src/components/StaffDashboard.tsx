@@ -5,6 +5,7 @@ import { dayLabel, timeLabel } from "../lib/format";
 import type { ClinicInfo, StaffAppointment } from "../lib/types";
 import { Header } from "./Chrome";
 import { StaffCalendar } from "./StaffCalendar";
+import { ReminderCell, StaffOnCall } from "./StaffOnCall";
 
 const TOKEN_KEY = "hc-staff-token";
 
@@ -37,7 +38,7 @@ interface Stats {
   calendar_sync_failures: number;
 }
 
-type Tab = "calendar" | "appointments" | "callbacks" | "conversations";
+type Tab = "calendar" | "appointments" | "callbacks" | "conversations" | "oncall";
 
 const SYNC_BADGE: Record<string, string> = {
   synced: "badge--success",
@@ -221,6 +222,7 @@ export function StaffDashboard({ clinic }: { clinic: ClinicInfo | null }) {
               ["appointments", "List"],
               ["callbacks", `Callbacks (${callbacks.length})`],
               ["conversations", "Conversations"],
+              ["oncall", "On call & phone"],
             ] as const
           ).map(([id, label]) => (
             <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>
@@ -230,6 +232,8 @@ export function StaffDashboard({ clinic }: { clinic: ClinicInfo | null }) {
         </div>
 
         {tab === "calendar" && <StaffCalendar token={token} clinic={clinic} onUnauthorized={signOut} />}
+
+        {tab === "oncall" && <StaffOnCall token={token} onUnauthorized={signOut} />}
 
         {tab === "appointments" && (
           <section className="card">
@@ -254,12 +258,13 @@ export function StaffDashboard({ clinic }: { clinic: ClinicInfo | null }) {
                     <th>Ref</th>
                     <th>Status</th>
                     <th>Google Calendar</th>
+                    <th>Reminder call</th>
                   </tr>
                 </thead>
                 <tbody>
                   {appointments.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="empty-row">
+                      <td colSpan={8} className="empty-row">
                         No appointments in this period.
                       </td>
                     </tr>
@@ -290,6 +295,9 @@ export function StaffDashboard({ clinic }: { clinic: ClinicInfo | null }) {
                         <span className={`badge ${SYNC_BADGE[a.calendar_sync_status] ?? ""}`} title={a.calendar_sync_error ?? undefined}>
                           {a.calendar_sync_status.replace("_", " ")}
                         </span>
+                      </td>
+                      <td>
+                        <ReminderCell appointment={a} token={token} onChanged={() => void load()} />
                       </td>
                     </tr>
                   ))}

@@ -93,6 +93,9 @@ class Clinician(Base):
     bio: Mapped[str] = mapped_column(Text, default="")
     google_calendar_id: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(default=True)
+    # Emergency (SOS) line: who gets called, and on which number (E.164 or UK format).
+    mobile_phone: Mapped[str | None] = mapped_column(String(20))
+    sos_available: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
 
     services: Mapped[list[Service]] = relationship(
         secondary=clinician_services, back_populates="clinicians", lazy="selectin"
@@ -160,6 +163,12 @@ class VoiceSession(Base):
     failed_verifications: Mapped[int] = mapped_column(Integer, default=0)
     conversation_id: Mapped[str | None] = mapped_column(String(64), index=True)
     client_ip: Mapped[str | None] = mapped_column(String(64))
+    # Phone calls: Twilio call SID and the caller's number (normalised UK format).
+    call_sid: Mapped[str | None] = mapped_column(String(64), index=True)
+    caller_number: Mapped[str | None] = mapped_column(String(20))
+    # "general", or "reminder" for outbound reminder calls (then appointment_ref says which one).
+    purpose: Mapped[str] = mapped_column(String(16), default="general", server_default="general")
+    appointment_ref: Mapped[uuid.UUID | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -190,6 +199,10 @@ class Appointment(Base):
     calendar_sync_status: Mapped[str] = mapped_column(String(16), default=CalendarSyncStatus.PENDING)
     calendar_sync_error: Mapped[str | None] = mapped_column(Text)
     synced_calendar_id: Mapped[str | None] = mapped_column(String(255))
+    # Reminder call the day before: None (not yet), calling, completed, failed, skipped.
+    reminder_status: Mapped[str | None] = mapped_column(String(16))
+    reminder_called_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reminder_conversation_id: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -245,6 +258,56 @@ class CallbackRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     patient: Mapped[Patient | None] = relationship(lazy="selectin")
+
+
+class EmergencyStatus(enum.StrEnum):
+    DIALLING = "dialling"  # doctors are being called; patient waiting in the conference
+    CONNECTED = "connected"  # at least one doctor joined
+    UNANSWERED = "unanswered"  # nobody joined in time; patient told to call 999
+    ENDED = "ended"
+    FAILED = "failed"
+
+
+class EmergencyIncident(Base):
+    """An SOS: the patient is put in a private conference and every available doctor is called."""
+
+    __tablename__ = "emergency_incidents"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("voice_sessions.id", ondelete="SET NULL"))
+    patient_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("patients.id", ondelete="SET NULL"))
+    channel: Mapped[str] = mapped_column(String(16))  # "web" | "phone"
+    reason: Mapped[str] = mapped_column(Text, default="")
+    caller_number: Mapped[str | None] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(16), default=EmergencyStatus.DIALLING)
+    conference_name: Mapped[str] = mapped_column(String(64), unique=True)
+    patient_call_sid: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    patient: Mapped[Patient | None] = relationship(lazy="selectin")
+    calls: Mapped[list[EmergencyCall]] = relationship(
+        back_populates="incident", lazy="selectin", cascade="all, delete-orphan", order_by="EmergencyCall.id"
+    )
+
+
+class EmergencyCall(Base):
+    """One outbound call to a doctor for an SOS."""
+
+    __tablename__ = "emergency_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("emergency_incidents.id", ondelete="CASCADE"), index=True)
+    clinician_id: Mapped[int | None] = mapped_column(ForeignKey("clinicians.id", ondelete="SET NULL"))
+    to_number: Mapped[str] = mapped_column(String(20))
+    call_sid: Mapped[str | None] = mapped_column(String(64), index=True)
+    # queued, ringing, answered, accepted (pressed 1), joined, completed, no-answer, busy, declined, failed
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    incident: Mapped[EmergencyIncident] = relationship(back_populates="calls")
+    clinician: Mapped[Clinician | None] = relationship(lazy="selectin")
 
 
 class ConversationRecord(Base):

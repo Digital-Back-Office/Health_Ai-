@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "r
 import { ApiError, api } from "../lib/api";
 import { dayLabel, longDate, timeLabel } from "../lib/format";
 import type { ClinicInfo, StaffAppointment } from "../lib/types";
+import { ReminderCell } from "./StaffOnCall";
 
 const HOUR_PX = 56;
 const COLORS = ["#31a991", "#3b82c4", "#8b6fd6", "#d9963a", "#d0627a", "#5f7a8a"];
@@ -397,12 +398,24 @@ export function StaffCalendar({ token, clinic, onUnauthorized }: Props) {
         {visible.length > 0 && !loading ? " · click an appointment for details" : ""}
       </div>
 
-      {selected && <AppointmentDialog appointment={selected} color={colorOf(selected.clinician_id)} onClose={() => setSelected(null)} />}
+      {selected && (
+        <AppointmentDialog appointment={selected} color={colorOf(selected.clinician_id)} token={token} onClose={() => setSelected(null)} />
+      )}
     </section>
   );
 }
 
-function AppointmentDialog({ appointment: a, color, onClose }: { appointment: StaffAppointment; color: string; onClose: () => void }) {
+function AppointmentDialog({
+  appointment: a,
+  color,
+  token,
+  onClose,
+}: {
+  appointment: StaffAppointment;
+  color: string;
+  token: string;
+  onClose: () => void;
+}) {
   const dob = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" }).format(
     new Date(`${a.patient.date_of_birth}T00:00:00Z`),
   );
@@ -456,6 +469,10 @@ function AppointmentDialog({ appointment: a, color, onClose }: { appointment: St
           )}
           <dt>Google Calendar</dt>
           <dd>{a.calendar_sync_status.replace("_", " ")}</dd>
+          <dt>Reminder call</dt>
+          <dd>
+            <ReminderCell appointment={a} token={token} />
+          </dd>
           <dt>Booked</dt>
           <dd>
             {dayLabel(a.created_at)}, {timeLabel(a.created_at)} by the AI receptionist

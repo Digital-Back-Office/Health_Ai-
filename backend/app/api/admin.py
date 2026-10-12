@@ -7,21 +7,29 @@ from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from .. import presenters, timeutil
+from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import (
     Appointment,
     AppointmentStatus,
     CalendarSyncStatus,
     CallbackRequest,
+    Clinician,
     ConversationRecord,
+    EmergencyIncident,
     VoiceSession,
 )
 from ..services.booking import resync_pending_calendar_events
+from ..services.elevenlabs import load_state
+from ..services.emergency import available_doctors, incident_payload
 from ..services.patients import format_postcode
-from .deps import DbSession, require_admin
+from ..services.reminders import place_reminder_call
+from ..services.telephony import TelephonyError, to_e164
+from .deps import DbSession, Phone, elevenlabs_client, require_admin
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -55,6 +63,7 @@ async def list_appointments(
             "booked_via": appt.booked_via,
             "created_at": appt.created_at.isoformat(),
             "cancellation_reason": appt.cancellation_reason,
+            "reminder_status": appt.reminder_status,
         }
         items.append(item)
     return {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(), "appointments": items}
@@ -152,3 +161,96 @@ async def stats(db: DbSession) -> dict[str, Any]:
 async def resync_calendar(request: Request) -> dict[str, Any]:
     processed = await resync_pending_calendar_events(get_sessionmaker(), request.app.state.calendar, limit=200)
     return {"ok": True, "processed": processed}
+
+
+# --- phone line, SOS on-call list, reminder calls --------------------------------------------
+
+
+@router.get("/telephony")
+async def telephony_status(db: DbSession, telephony: Phone) -> dict[str, Any]:
+    settings = get_settings()
+    state = load_state()
+    return {
+        "configured": telephony.enabled,
+        "clinic_number": settings.twilio_phone_number,
+        "number_connected_to_agent": bool(state.get("phone_number_id")),
+        "browser_calling": bool(settings.twilio_api_key_sid and (settings.twilio_twiml_app_sid or state.get("twiml_app_sid"))),
+        "reception_number": settings.reception_phone_number,
+        "sms_enabled": telephony.enabled and settings.sms_enabled,
+        "reminder_calls_enabled": settings.reminder_calls_enabled,
+        "reminder_call_hour": settings.reminder_call_hour,
+        "sos_doctors_available": len(await available_doctors(db)),
+    }
+
+
+def _clinician_row(c: Clinician) -> dict[str, Any]:
+    return {"id": c.id, "name": c.full_name, "role": c.role, "mobile_phone": c.mobile_phone, "sos_available": c.sos_available}
+
+
+@router.get("/clinicians")
+async def list_clinicians(db: DbSession) -> dict[str, Any]:
+    rows = (await db.execute(select(Clinician).where(Clinician.is_active.is_(True)).order_by(Clinician.full_name))).scalars()
+    return {"clinicians": [_clinician_row(c) for c in rows]}
+
+
+class ClinicianUpdate(BaseModel):
+    mobile_phone: str | None = Field(default=None, max_length=24)
+    sos_available: bool | None = None
+
+
+@router.patch("/clinicians/{clinician_id}")
+async def update_clinician(clinician_id: int, body: ClinicianUpdate, db: DbSession) -> dict[str, Any]:
+    clinician = await db.get(Clinician, clinician_id)
+    if clinician is None:
+        raise HTTPException(status_code=404, detail="Clinician not found")
+    fields = body.model_fields_set
+    if "mobile_phone" in fields:
+        if body.mobile_phone and body.mobile_phone.strip():
+            try:
+                clinician.mobile_phone = to_e164(body.mobile_phone)
+            except TelephonyError as exc:
+                raise HTTPException(status_code=422, detail=f"'{body.mobile_phone}' isn't a valid phone number") from exc
+        else:
+            clinician.mobile_phone = None
+    if "sos_available" in fields and body.sos_available is not None:
+        if body.sos_available and not clinician.mobile_phone:
+            raise HTTPException(status_code=422, detail="Add a mobile number before marking a doctor available for SOS")
+        clinician.sos_available = body.sos_available
+    if not clinician.mobile_phone:
+        clinician.sos_available = False
+    await db.commit()
+    return _clinician_row(clinician)
+
+
+@router.get("/emergencies")
+async def list_emergencies(db: DbSession, limit: int = 20) -> dict[str, Any]:
+    rows = (
+        await db.execute(select(EmergencyIncident).order_by(EmergencyIncident.created_at.desc()).limit(min(limit, 100)))
+    ).scalars()
+    items = []
+    for incident in rows:
+        payload = incident_payload(incident)
+        patient = incident.patient
+        payload |= {
+            "created_at": incident.created_at.isoformat(),
+            "connected_at": incident.connected_at.isoformat() if incident.connected_at else None,
+            "ended_at": incident.ended_at.isoformat() if incident.ended_at else None,
+            "reason": incident.reason,
+            "patient": f"{patient.first_name} {patient.last_name}" if patient else None,
+            "caller_number": incident.caller_number,
+        }
+        items.append(payload)
+    return {"emergencies": items}
+
+
+@router.post("/appointments/{appointment_id}/reminder-call")
+async def reminder_call_now(appointment_id: uuid.UUID, request: Request) -> dict[str, Any]:
+    """Ring the patient about this appointment now (useful for testing reminder calls)."""
+    client = elevenlabs_client(request.app)
+    if client is None or not request.app.state.telephony.enabled:
+        raise HTTPException(status_code=503, detail="Reminder calls need ElevenLabs and Twilio to be set up.")
+    result = await place_reminder_call(get_sessionmaker(), client, appointment_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("message") or "The reminder call couldn't be placed.")
+    return result
+

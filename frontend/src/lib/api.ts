@@ -1,4 +1,10 @@
-import type { ClinicInfo, SessionState, StartedSession } from "./types";
+import type { ClinicInfo, SessionState, SosPayload, SosStarted, StartedSession } from "./types";
+
+/** The parts of a session needed to authenticate as it (AI conversation or SOS-only). */
+export interface SessionAuth {
+  session_id: string;
+  session_token: string;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -53,12 +59,37 @@ export const api = {
     request<SessionState>(`/api/sessions/${session.session_id}/state`, {}, session.session_token),
 
   /** Best effort, also works while the page is unloading. */
-  endSession: (session: StartedSession) => {
+  endSession: (session: SessionAuth) => {
     const url = `/api/sessions/${session.session_id}/end`;
     const body = JSON.stringify({ token: session.session_token });
     if (navigator.sendBeacon?.(url, new Blob([body], { type: "application/json" }))) return;
     void fetch(url, { method: "POST", body, headers: { "Content-Type": "application/json" }, keepalive: true }).catch(() => {});
   },
+
+  /** SOS during a conversation, or (without a session) straight from the SOS button. */
+  startSos: (session: SessionAuth | null, reason?: string) =>
+    session
+      ? request<SosStarted>(
+          `/api/sessions/${session.session_id}/sos`,
+          { method: "POST", body: JSON.stringify({ reason }) },
+          session.session_token,
+        )
+      : request<SosStarted>("/api/sos", { method: "POST", body: JSON.stringify({ reason }) }),
+
+  sosStatus: (session: SessionAuth, incidentId: string) =>
+    request<SosPayload>(`/api/sessions/${session.session_id}/sos/${incidentId}`, {}, session.session_token),
+
+  /** The patient hung up (or couldn't connect): stop ringing the doctors. */
+  endSos: (session: SessionAuth, incidentId: string) =>
+    request<void>(`/api/sessions/${session.session_id}/sos/${incidentId}/end`, { method: "POST" }, session.session_token),
+
+  /** Short-lived Twilio token so this browser can join the SOS call or call reception. */
+  voiceToken: (session: SessionAuth, purpose: "sos" | "reception") =>
+    request<{ token: string; identity: string; edge: string }>(
+      `/api/sessions/${session.session_id}/voice-token`,
+      { method: "POST", body: JSON.stringify({ purpose }) },
+      session.session_token,
+    ),
 
   staff: <T,>(path: string, token: string, init: RequestInit = {}) => request<T>(`/api/admin${path}`, init, token),
 };

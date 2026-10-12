@@ -8,6 +8,7 @@ import { VisitPanel } from "./components/VisitPanel";
 import { api } from "./lib/api";
 import { longDate, timeLabel } from "./lib/format";
 import type { ClinicInfo, Slot } from "./lib/types";
+import { useHumanCall } from "./lib/useHumanCall";
 import { useReceptionist } from "./lib/useReceptionist";
 
 // Dev-only UI preview; tree-shaken out of production builds.
@@ -43,7 +44,20 @@ function useClinic(): ClinicInfo | null {
 }
 
 function PatientApp({ clinic }: { clinic: ClinicInfo | null }) {
-  const r = useReceptionist();
+  const human = useHumanCall();
+  const r = useReceptionist({
+    // Sophie started the SOS call, or is putting the patient through to reception.
+    onHumanRequest: (request) => {
+      if (request.kind === "sos") void human.joinSos(request.session, request.incident);
+      else void human.callReception(request.session);
+    },
+  });
+
+  // The SOS button: hand any conversation over straight away (no waiting for Sophie).
+  const startSos = () => {
+    const inConversation = r.phase === "preparing" || r.phase === "connecting" || r.phase === "live";
+    void human.startSos(inConversation ? r.handOver() : Promise.resolve(null));
+  };
 
   const pickSlot = useCallback(
     (slot: Slot) => {
@@ -56,7 +70,7 @@ function PatientApp({ clinic }: { clinic: ClinicInfo | null }) {
     <>
       <Header clinic={clinic} />
       <main className="shell page">
-        <AssistantCard r={r} clinic={clinic} />
+        <AssistantCard r={r} clinic={clinic} human={human} onSos={startSos} />
         <div className="stack">
           <VisitPanel visit={r.visit} live={r.phase === "live"} clinic={clinic} onPickSlot={pickSlot} />
           <ClinicCard clinic={clinic} />

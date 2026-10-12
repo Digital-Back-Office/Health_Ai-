@@ -11,13 +11,17 @@ import {
   MicOff,
   PhoneOff,
   Send,
+  Siren,
   Sparkles,
   TriangleAlert,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { ClinicInfo } from "../lib/types";
+import type { HumanCall } from "../lib/useHumanCall";
 import type { Mode, Receptionist } from "../lib/useReceptionist";
+import { Elapsed } from "./Elapsed";
+import { HumanCallPanel, SosSheet } from "./HumanCall";
 import { VoiceOrb, type OrbState } from "./VoiceOrb";
 
 const SUGGESTIONS = [
@@ -27,35 +31,27 @@ const SUGGESTIONS = [
   { icon: Clock, text: "What are your opening hours?" },
 ];
 
-function Elapsed({ since }: { since: number }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-  const seconds = Math.max(0, Math.floor((now - since) / 1000));
-  return (
-    <span className="assistant__timer" aria-label="Conversation length">
-      {String(Math.floor(seconds / 60)).padStart(2, "0")}:{String(seconds % 60).padStart(2, "0")}
-    </span>
-  );
-}
-
 interface Props {
   r: Receptionist;
   clinic: ClinicInfo | null;
+  /** A call with people (SOS doctors / reception) that takes over from the AI. */
+  human: HumanCall;
+  onSos: () => void;
 }
 
-export function AssistantCard({ r, clinic }: Props) {
+export function AssistantCard({ r, clinic, human, onSos }: Props) {
   const [preferredMode, setPreferredMode] = useState<Mode>("voice");
   const [draft, setDraft] = useState("");
+  const [sosOpen, setSosOpen] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const lastActivityRef = useRef(0);
   const assistant = clinic?.assistant_name ?? "Sophie";
 
+  const onHumanCall = human.phase !== "idle";
   const busy = r.phase === "preparing" || r.phase === "connecting";
   const live = r.phase === "live";
   const voiceLive = live && r.mode === "voice";
+  const closeSos = useCallback(() => setSosOpen(false), []);
 
   useEffect(() => {
     const el = transcriptRef.current;
@@ -87,7 +83,9 @@ export function AssistantCard({ r, clinic }: Props) {
     }
   })();
 
-  const begin = (message?: string) => void r.start(preferredMode, message);
+  const begin = (message?: string) => {
+    if (!onHumanCall) void r.start(preferredMode, message);
+  };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -107,71 +105,96 @@ export function AssistantCard({ r, clinic }: Props) {
 
   return (
     <section className="card assistant" aria-labelledby="assistant-title">
-      <div className="assistant__hero">
-        <span className="eyebrow">AI receptionist</span>
-        <h1 id="assistant-title" className="assistant__title">
-          Hi, I'm {assistant}. How can I help?
-        </h1>
-        <p className="assistant__lead">
-          Book, reschedule or cancel an appointment, or ask about our services, prices and opening hours. Just talk to me
-          as you would on the phone.
-        </p>
+      {onHumanCall ? (
+        <HumanCallPanel call={human} assistant={assistant} />
+      ) : (
+        <div className="assistant__hero">
+          <button
+            type="button"
+            className="sos-btn"
+            onClick={() => setSosOpen(true)}
+            aria-label="SOS: get emergency help"
+            title="Emergency help"
+          >
+            <Siren size={17} /> SOS
+          </button>
+          <span className="eyebrow">AI receptionist</span>
+          <h1 id="assistant-title" className="assistant__title">
+            Hi, I'm {assistant}. How can I help?
+          </h1>
+          <p className="assistant__lead">
+            Book, reschedule or cancel an appointment, or ask about our services, prices and opening hours. Just talk to me
+            as you would on the phone.
+          </p>
 
-        <VoiceOrb state={orbState} getLevel={r.isSpeaking ? r.getOutputVolume : r.getInputVolume} />
+          <VoiceOrb state={orbState} getLevel={r.isSpeaking ? r.getOutputVolume : r.getInputVolume} />
 
-        <div className={`assistant__status${live ? " assistant__status--live" : ""}`} role="status" aria-live="polite">
-          {live && <span className="dot dot--pulse" />}
-          {statusText}
-          {live && r.startedAt && <Elapsed since={r.startedAt} />}
+          <div className={`assistant__status${live ? " assistant__status--live" : ""}`} role="status" aria-live="polite">
+            {live && <span className="dot dot--pulse" />}
+            {statusText}
+            {live && r.startedAt && <Elapsed since={r.startedAt} label="Conversation length" />}
+          </div>
+
+          <div className="assistant__controls">
+            {!live && !busy && (
+              <>
+                <div className="mode-switch" role="group" aria-label="How would you like to talk?">
+                  <button type="button" aria-pressed={preferredMode === "voice"} onClick={() => setPreferredMode("voice")}>
+                    <Mic size={15} /> Talk
+                  </button>
+                  <button type="button" aria-pressed={preferredMode === "text"} onClick={() => setPreferredMode("text")}>
+                    <Keyboard size={15} /> Type
+                  </button>
+                </div>
+                <button type="button" className="btn btn--primary btn--lg" onClick={() => begin()}>
+                  {preferredMode === "voice" ? <Mic size={19} /> : <MessageSquareText size={19} />}
+                  {r.phase === "ended" ? "Start a new conversation" : preferredMode === "voice" ? "Start talking" : "Start chatting"}
+                </button>
+              </>
+            )}
+            {busy && (
+              <>
+                <button type="button" className="btn btn--primary btn--lg" disabled>
+                  <LoaderCircle size={19} className="spin" /> Connecting…
+                </button>
+                <button type="button" className="btn btn--ghost btn--lg" onClick={r.end}>
+                  Cancel
+                </button>
+              </>
+            )}
+            {live && (
+              <>
+                {r.mode === "voice" && (
+                  <button
+                    type="button"
+                    className={`btn btn--ghost btn--lg${r.isMuted ? " btn--toggled" : ""}`}
+                    onClick={() => r.setMuted(!r.isMuted)}
+                    aria-pressed={r.isMuted}
+                  >
+                    {r.isMuted ? <MicOff size={18} /> : <Mic size={18} />}
+                    {r.isMuted ? "Unmute" : "Mute"}
+                  </button>
+                )}
+                <button type="button" className="btn btn--danger btn--lg" onClick={r.end}>
+                  <PhoneOff size={18} /> End
+                </button>
+              </>
+            )}
+          </div>
         </div>
+      )}
 
-        <div className="assistant__controls">
-          {!live && !busy && (
-            <>
-              <div className="mode-switch" role="group" aria-label="How would you like to talk?">
-                <button type="button" aria-pressed={preferredMode === "voice"} onClick={() => setPreferredMode("voice")}>
-                  <Mic size={15} /> Talk
-                </button>
-                <button type="button" aria-pressed={preferredMode === "text"} onClick={() => setPreferredMode("text")}>
-                  <Keyboard size={15} /> Type
-                </button>
-              </div>
-              <button type="button" className="btn btn--primary btn--lg" onClick={() => begin()}>
-                {preferredMode === "voice" ? <Mic size={19} /> : <MessageSquareText size={19} />}
-                {r.phase === "ended" ? "Start a new conversation" : preferredMode === "voice" ? "Start talking" : "Start chatting"}
-              </button>
-            </>
-          )}
-          {busy && (
-            <>
-              <button type="button" className="btn btn--primary btn--lg" disabled>
-                <LoaderCircle size={19} className="spin" /> Connecting…
-              </button>
-              <button type="button" className="btn btn--ghost btn--lg" onClick={r.end}>
-                Cancel
-              </button>
-            </>
-          )}
-          {live && (
-            <>
-              {r.mode === "voice" && (
-                <button
-                  type="button"
-                  className={`btn btn--ghost btn--lg${r.isMuted ? " btn--toggled" : ""}`}
-                  onClick={() => r.setMuted(!r.isMuted)}
-                  aria-pressed={r.isMuted}
-                >
-                  {r.isMuted ? <MicOff size={18} /> : <Mic size={18} />}
-                  {r.isMuted ? "Unmute" : "Mute"}
-                </button>
-              )}
-              <button type="button" className="btn btn--danger btn--lg" onClick={r.end}>
-                <PhoneOff size={18} /> End
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+      {sosOpen && (
+        <SosSheet
+          assistant={assistant}
+          emergencyLine={clinic?.emergency_line ?? false}
+          onClose={closeSos}
+          onConfirm={() => {
+            setSosOpen(false);
+            onSos();
+          }}
+        />
+      )}
 
       <div className="conversation">
         <div className="transcript" ref={transcriptRef} aria-live="polite" aria-label="Conversation transcript">
@@ -187,7 +210,7 @@ export function AssistantCard({ r, clinic }: Props) {
                     key={text}
                     type="button"
                     className="chip"
-                    disabled={busy}
+                    disabled={busy || onHumanCall}
                     onClick={() => (live ? r.sendText(text) : begin(text))}
                   >
                     <Icon size={15} /> {text}

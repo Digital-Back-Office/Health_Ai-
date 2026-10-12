@@ -21,6 +21,8 @@ dependencies = [
     "google-auth-httplib2>=0.2",
     "google-api-python-client>=2.150",
     "tzdata>=2024.2",
+    "twilio>=9.12",
+    "python-multipart>=0.0.20",
 ]
 
 [project.optional-dependencies]
