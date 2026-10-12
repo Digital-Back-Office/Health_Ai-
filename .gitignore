@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets & local config
+.elevenlabs-state.json
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+service-account*.json
+*-sa.json
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
