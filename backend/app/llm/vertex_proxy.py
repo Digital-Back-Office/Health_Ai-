@@ -223,8 +223,22 @@ async def _send(
 ) -> httpx.Response:
     """POST to Vertex with retries for transient errors, token expiry and thinking-param rejections."""
     url = f"{settings.vertex_base_url}/chat/completions"
+    fallback = settings.vertex_fallback_location
+    fallback_url = (
+        f"{settings.vertex_url_for(fallback)}/chat/completions" if fallback and fallback != settings.vertex_location else None
+    )
+
+    def switch_to_fallback(reason: str) -> bool:
+        """Send the next attempt to the fallback region (it has its own quota), once."""
+        nonlocal url, fallback_url
+        if not fallback_url:
+            return False
+        log.warning("Vertex %s in %s - trying %s", reason, settings.vertex_location, fallback)
+        url, fallback_url = fallback_url, None
+        return True
+
     force_refresh = False
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             headers = await tokens.auth_headers(force_refresh=force_refresh)
         except VertexAuthError as exc:
@@ -245,7 +259,7 @@ async def _send(
             response = await http.send(request, stream=stream)
         except httpx.TransportError as exc:  # timeouts, dropped connections
             log.warning("Vertex request failed (attempt %d): %s", attempt + 1, type(exc).__name__)
-            if attempt < 1:
+            if switch_to_fallback(type(exc).__name__) or attempt < 1:
                 continue
             raise HTTPException(status_code=504, detail="Vertex AI didn't answer in time") from exc
         if response.status_code == 200:
@@ -261,7 +275,9 @@ async def _send(
         ):
             payload = {k: v for k, v in payload.items() if k != "reasoning_effort"}
             continue
-        if response.status_code in RETRYABLE_STATUS and attempt < 2:
+        if response.status_code in RETRYABLE_STATUS and switch_to_fallback(f"returned {response.status_code}"):
+            continue
+        if response.status_code in RETRYABLE_STATUS and attempt < 3:
             await asyncio.sleep(0.3 * (attempt + 1))
             continue
         raise HTTPException(status_code=502, detail=f"Vertex AI error {response.status_code}: {body[:300]}")

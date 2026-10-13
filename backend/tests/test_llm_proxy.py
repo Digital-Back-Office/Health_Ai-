@@ -212,3 +212,17 @@ async def test_vertex_timeout_is_retried_then_reported_cleanly(client: httpx.Asy
         route = respx.post(VERTEX_URL).mock(side_effect=httpx.ReadTimeout("slow"))
         response = await client.post("/v1/chat/completions", json=body, headers=AUTH)
     assert response.status_code == 504 and route.call_count == 2
+
+
+async def test_busy_region_falls_back_to_the_backup_region(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(get_settings(), "vertex_fallback_location", "europe-west3")
+    backup_url = VERTEX_URL.replace("europe-west2", "europe-west3")
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False}
+    with respx.mock:
+        london = respx.post(VERTEX_URL).mock(return_value=httpx.Response(429, json={"error": "too many requests"}))
+        frankfurt = respx.post(backup_url).mock(
+            return_value=httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "Hello"}}]})
+        )
+        response = await client.post("/v1/chat/completions", json=body, headers=AUTH)
+    assert response.status_code == 200
+    assert london.call_count == 1 and frankfurt.call_count == 1

@@ -87,7 +87,9 @@ class Settings(BaseSettings):
 
     # --- Vertex AI (custom LLM) ---------------------------------------------
     vertex_project_id: str | None = None
-    vertex_location: str = "global"
+    vertex_location: str = "europe-west2"
+    # Used when vertex_location answers 429/5xx or times out (a separate quota), e.g. europe-west3.
+    vertex_fallback_location: str | None = None
     vertex_model: str = "google/gemini-3.5-flash"
     # "minimal" keeps voice turns around a second; "low" adds roughly 2 s of thinking.
     vertex_reasoning_effort: str | None = "minimal"
@@ -143,6 +145,7 @@ class Settings(BaseSettings):
         "vertex_project_id",
         "google_impersonate_user",
         "vertex_reasoning_effort",
+        "vertex_fallback_location",
         # Blank paths must mean "not set", not Path("") == Path(".").
         "vertex_credentials_file",
         "google_service_account_file",
@@ -197,15 +200,11 @@ class Settings(BaseSettings):
 
     @property
     def vertex_base_url(self) -> str:
-        host = (
-            "aiplatform.googleapis.com"
-            if self.vertex_location == "global"
-            else f"{self.vertex_location}-aiplatform.googleapis.com"
-        )
-        return (
-            f"https://{host}/v1/projects/{self.vertex_project_id}"
-            f"/locations/{self.vertex_location}/endpoints/openapi"
-        )
+        return self.vertex_url_for(self.vertex_location)
+
+    def vertex_url_for(self, location: str) -> str:
+        host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+        return f"https://{host}/v1/projects/{self.vertex_project_id}/locations/{location}/endpoints/openapi"
 
 
 @lru_cache
