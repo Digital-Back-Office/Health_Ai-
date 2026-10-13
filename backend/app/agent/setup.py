@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,6 +44,17 @@ class ApiError(SetupError):
         super().__init__(f"{method} {path} failed with HTTP {status}:\n{body[:2000]}")
         self.status = status
         self.body = body
+
+    @property
+    def message(self) -> str:
+        """ElevenLabs' human-readable error message, if the body has one."""
+        try:
+            detail = json.loads(self.body).get("detail")
+        except (ValueError, AttributeError):
+            return self.body[:300]
+        if isinstance(detail, dict):
+            return str(detail.get("message") or detail)[:300]
+        return str(detail)[:300]
 
 
 class ElevenLabsAdmin:
@@ -385,11 +397,51 @@ def ensure_documents(api: ElevenLabsAdmin, state: dict[str, Any], clinic_name: s
     return refs, stale
 
 
+def _voice_in_account(api: ElevenLabsAdmin, voice_id: str) -> bool:
+    try:
+        api.call("GET", f"/v1/voices/{voice_id}")
+        return True
+    except ApiError as exc:
+        if exc.status in (400, 404):  # ElevenLabs answers 400 "voice_not_found"
+            return False
+        raise
+
+
+def _add_from_voice_library(api: ElevenLabsAdmin, voice_id: str, log: Callable[[str], None]) -> str | None:
+    """A Voice Library voice has to be added to the account's voices before an agent can use it."""
+    shared = api.call("GET", "/v1/shared-voices", params={"search": voice_id, "page_size": 30}).get("voices", [])
+    match = next((v for v in shared if v.get("voice_id") == voice_id), None)
+    if match is None:
+        return None
+    name = match.get("name") or "Receptionist voice"
+    if match.get("live_moderation_enabled"):
+        log(f"  [!!] '{name}' has live moderation turned on by its owner, so ElevenLabs agents can't use it.")
+        return None
+    try:
+        added = api.call("POST", f"/v1/voices/add/{match['public_owner_id']}/{voice_id}", json={"new_name": name})
+    except ApiError as exc:
+        log(f"  [!!] Couldn't add '{name}' from the Voice Library (HTTP {exc.status}): {exc.body[:200]}")
+        return None
+    log(f"Added '{name}' from the Voice Library to your voices.")
+    return added.get("voice_id") or voice_id
+
+
 def resolve_voice(api: ElevenLabsAdmin, settings: Settings, state: dict[str, Any], log: Callable[[str], None]) -> str:
-    if settings.elevenlabs_voice_id:
-        return settings.elevenlabs_voice_id
-    if state.get("voice_id"):
-        return state["voice_id"]
+    wanted = settings.elevenlabs_voice_id
+    if wanted:
+        if _voice_in_account(api, wanted):
+            return wanted
+        added = _add_from_voice_library(api, wanted, log)
+        if added:
+            return added
+        # Don't let a typo block the rest of the update (tool and LLM URLs must stay current).
+        log(
+            f"  [!!] ELEVENLABS_VOICE_ID {wanted} isn't in your ElevenLabs voices or the Voice Library - "
+            "keeping the current voice. Copy the ID from ElevenLabs > Voices."
+        )
+    previous = state.get("voice_id")
+    if previous and previous != wanted and _voice_in_account(api, previous):
+        return previous
     voices = api.call("GET", "/v1/voices").get("voices", [])
 
     def score(voice: dict[str, Any]) -> tuple[int, int]:
@@ -678,39 +730,42 @@ def run_setup(*, force_new_agent: bool = False, log: Callable[[str], None] = pri
         save_state(state)
 
         voice_id = resolve_voice(api, settings, state, log)
-        state["voice_id"] = voice_id
-        payload = agent_payload(
-            settings,
-            clinic,
-            prompt=build_prompt(settings, clinic),
-            tool_ids=tool_ids,
-            documents=documents,
-            llm_secret_id=llm_secret_id,
-            voice_id=voice_id,
-            token_var=state["session_token_var"],
-            tool_secret_id=tool_secret_id,
-        )
+        prompt = build_prompt(settings, clinic)
 
-        agent_id = None if force_new_agent else (settings.elevenlabs_agent_id or state.get("agent_id"))
-        try:
-            agent_id = _save_agent(api, payload, agent_id, log)
-        except ApiError as exc:
-            if not (settings.telephony_configured and exc.status == 422 and "request_headers" in exc.body):
-                raise
-            log("  ElevenLabs wants a plain header value for the call-start webhook - retrying.")
-            payload = agent_payload(
+        def payload_for(voice: str, plain_webhook_header: bool) -> dict[str, Any]:
+            return agent_payload(
                 settings,
                 clinic,
-                prompt=build_prompt(settings, clinic),
+                prompt=prompt,
                 tool_ids=tool_ids,
                 documents=documents,
                 llm_secret_id=llm_secret_id,
-                voice_id=voice_id,
+                voice_id=voice,
                 token_var=state["session_token_var"],
                 tool_secret_id=tool_secret_id,
-                plain_webhook_header=True,
+                plain_webhook_header=plain_webhook_header,
             )
-            agent_id = _save_agent(api, payload, agent_id, log)
+
+        agent_id = None if force_new_agent else (settings.elevenlabs_agent_id or state.get("agent_id"))
+        plain_webhook_header = False
+        for _attempt in range(3):
+            try:
+                agent_id = _save_agent(api, payload_for(voice_id, plain_webhook_header), agent_id, log)
+                break
+            except ApiError as exc:
+                if settings.telephony_configured and exc.status == 422 and "request_headers" in exc.body and not plain_webhook_header:
+                    log("  ElevenLabs wants a plain header value for the call-start webhook - retrying.")
+                    plain_webhook_header = True
+                    continue
+                previous = state.get("voice_id")  # the voice the agent last saved with
+                if "tts.voice_id" in exc.body and previous and previous != voice_id:
+                    # e.g. a Voice Library voice with live moderation: agents can't use it.
+                    log(f"  [!!] ElevenLabs won't use voice {voice_id} for agents: {exc.message}")
+                    log("       Keeping the current voice - choose another one for ELEVENLABS_VOICE_ID.")
+                    voice_id = previous
+                    continue
+                raise
+        state["voice_id"] = voice_id
         state["agent_id"] = agent_id
         save_state(state)
 

@@ -168,3 +168,39 @@ async def test_proxy_non_streaming(client: httpx.AsyncClient) -> None:
     respx.post(VERTEX_URL).mock(return_value=httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "Hi"}}]}))
     response = await client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}, headers=AUTH)
     assert response.json()["choices"][0]["message"]["content"] == "Hi"
+
+
+async def test_expired_google_login_gives_a_clear_error_and_recovers(client: httpx.AsyncClient) -> None:
+    """After `gcloud auth application-default login` the proxy works again without a restart."""
+    from google.auth.exceptions import RefreshError
+
+    from app.llm.vertex_proxy import VertexTokenProvider
+    from app.main import app
+
+    class Credentials:
+        def __init__(self, works: bool) -> None:
+            self.works, self.valid, self.token = works, False, None
+
+        def refresh(self, request: object) -> None:
+            if not self.works:
+                raise RefreshError("Reauthentication is needed.")
+            self.valid, self.token = True, "fresh-token"
+
+        def apply(self, headers: dict[str, str]) -> None:
+            headers["authorization"] = f"Bearer {self.token}"
+
+    logins = [Credentials(works=False), Credentials(works=True)]  # expired, then logged in again
+    provider = VertexTokenProvider(None)
+    provider._load = lambda: logins.pop(0)  # type: ignore[method-assign]
+    app.state.vertex_tokens = provider
+
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False}
+    failed = await client.post("/v1/chat/completions", json=body, headers=AUTH)
+    assert failed.status_code == 503 and "credentials" in failed.json()["detail"]
+
+    with respx.mock:
+        respx.post(VERTEX_URL).mock(
+            return_value=httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "Hello"}}]})
+        )
+        recovered = await client.post("/v1/chat/completions", json=body, headers=AUTH)
+    assert recovered.status_code == 200

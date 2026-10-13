@@ -42,6 +42,10 @@ DROPPED_REQUEST_KEYS = {"elevenlabs_extra_body", "user_id", "user"}
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+class VertexAuthError(Exception):
+    """Google credentials can't be used, e.g. the gcloud login has expired."""
+
+
 class VertexTokenProvider:
     """Google credentials for Vertex AI, refreshed before expiry.
 
@@ -70,13 +74,21 @@ class VertexTokenProvider:
     async def auth_headers(self, force_refresh: bool = False) -> dict[str, str]:
         """Authorization header, plus x-goog-user-project when the credentials carry
         a quota project (as gcloud user credentials usually do)."""
-        async with self._lock:
-            if self._credentials is None:
-                self._credentials = await asyncio.to_thread(self._load)
-            if force_refresh or not self._credentials.valid:
-                from google.auth.transport.requests import Request as GoogleRequest
+        from google.auth.exceptions import GoogleAuthError
 
-                await asyncio.to_thread(self._credentials.refresh, GoogleRequest())
+        async with self._lock:
+            try:
+                if self._credentials is None:
+                    self._credentials = await asyncio.to_thread(self._load)
+                if force_refresh or not self._credentials.valid:
+                    from google.auth.transport.requests import Request as GoogleRequest
+
+                    await asyncio.to_thread(self._credentials.refresh, GoogleRequest())
+            except GoogleAuthError as exc:
+                # Load them again next time, so a fresh `gcloud auth application-default login`
+                # is picked up without restarting the backend.
+                self._credentials = None
+                raise VertexAuthError(str(exc)) from exc
             headers: dict[str, str] = {}
             self._credentials.apply(headers)
             return headers
@@ -213,7 +225,15 @@ async def _send(
     url = f"{settings.vertex_base_url}/chat/completions"
     force_refresh = False
     for attempt in range(3):
-        headers = await tokens.auth_headers(force_refresh=force_refresh)
+        try:
+            headers = await tokens.auth_headers(force_refresh=force_refresh)
+        except VertexAuthError as exc:
+            log.error(
+                "Google credentials for Vertex AI don't work: %s  Fix: run `gcloud auth application-default login` "
+                "(or set VERTEX_CREDENTIALS_FILE); no restart needed.",
+                exc,
+            )
+            raise HTTPException(status_code=503, detail="Vertex AI credentials need attention - see the backend log") from exc
         request = http.build_request(
             "POST",
             url,

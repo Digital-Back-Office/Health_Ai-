@@ -115,3 +115,22 @@ def test_browser_token_picks_up_a_twiml_app_created_later(tmp_path, monkeypatch)
     el.save_state({"twiml_app_sid": "AP" + "4" * 32}, state_file)  # setup-agent ran meanwhile
     claims = jwt.decode(telephony.browser_token("web-abc"), options={"verify_signature": False})
     assert claims["grants"]["voice"]["outgoing"]["application_sid"] == "AP" + "4" * 32
+
+
+def test_backend_follows_a_new_tunnel_url(tmp_path, monkeypatch) -> None:
+    from app.config import refresh_public_base_url
+
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("PUBLIC_BASE_URL=https://old.ngrok-free.app\n", encoding="utf-8")
+    settings = Settings(_env_file=env_file)
+    assert settings.public_base_url == "https://old.ngrok-free.app"
+    assert refresh_public_base_url(settings, env_file) is None  # unchanged
+
+    env_file.write_text("PUBLIC_BASE_URL=https://new.ngrok-free.app/\n", encoding="utf-8")  # dev.ps1 rewrote it
+    assert refresh_public_base_url(settings, env_file) == "https://new.ngrok-free.app"
+    assert settings.public_base_url == "https://new.ngrok-free.app"
+
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://pinned.example")  # a real env var always wins
+    env_file.write_text("PUBLIC_BASE_URL=https://other.ngrok-free.app\n", encoding="utf-8")
+    assert refresh_public_base_url(settings, env_file) is None

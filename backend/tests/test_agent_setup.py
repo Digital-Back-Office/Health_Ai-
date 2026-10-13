@@ -87,3 +87,40 @@ async def test_agent_payload_uses_custom_llm_and_auth(db: AsyncSession) -> None:
     assert prompt_cfg["timezone"] == "Europe/London"
     assert payload["conversation_config"]["agent"]["language"] == "en"
     assert payload["platform_settings"]["auth"]["enable_auth"] is True
+
+
+class _FakeVoiceApi:
+    """Just enough of the ElevenLabs admin API for resolve_voice."""
+
+    def __init__(self, account: set[str], library: dict[str, str]) -> None:
+        self.account, self.library, self.added = account, library, []
+
+    def call(self, method: str, path: str, *, json=None, params=None, allow_404: bool = False):
+        from app.agent.setup import ApiError
+
+        if method == "GET" and path.startswith("/v1/voices/"):
+            if path.rsplit("/", 1)[1] not in self.account:
+                raise ApiError(method, path, 400, '{"detail":{"status":"voice_not_found"}}')
+            return {}
+        if path == "/v1/shared-voices":
+            return {"voices": [{"voice_id": vid, "public_owner_id": owner, "name": "Sally"} for vid, owner in self.library.items() if vid in params["search"]]}
+        if method == "POST" and path.startswith("/v1/voices/add/"):
+            voice_id = path.rsplit("/", 1)[1]
+            self.added.append(voice_id)
+            self.account.add(voice_id)
+            return {"voice_id": voice_id}
+        raise AssertionError(f"unexpected call {method} {path}")
+
+
+def test_voice_library_voice_is_added_and_a_bad_id_keeps_the_current_voice(monkeypatch) -> None:
+    from app.agent.setup import resolve_voice
+
+    settings = get_settings()
+    state = {"voice_id": "alice"}
+    api = _FakeVoiceApi(account={"alice"}, library={"sally": "owner-1"})
+
+    monkeypatch.setattr(settings, "elevenlabs_voice_id", "sally")
+    assert resolve_voice(api, settings, state, print) == "sally" and api.added == ["sally"]
+
+    monkeypatch.setattr(settings, "elevenlabs_voice_id", "typo-id")
+    assert resolve_voice(api, settings, state, print) == "alice"

@@ -105,7 +105,7 @@ def cmd_voices(args: argparse.Namespace) -> int:
     with _elevenlabs_client() as client:
         if args.action == "search":
             params: dict[str, Any] = {
-                "page_size": args.limit,
+                "page_size": min(args.limit * 3, 100),  # some are filtered out below
                 "gender": "female",
                 "accent": "british",
                 "language": "en",
@@ -116,14 +116,16 @@ def cmd_voices(args: argparse.Namespace) -> int:
                 params["use_cases"] = args.use_case
             response = client.get("/v1/shared-voices", params=params)
             response.raise_for_status()
-            voices = response.json().get("voices", [])
+            # Voices with live moderation can't be used by ElevenLabs agents.
+            voices = [v for v in response.json().get("voices", []) if not v.get("live_moderation_enabled")][: args.limit]
             if not voices:
                 print("No voices matched. Try --age '' or --use-case ''.")
             for v in voices:
-                print(f"\n{v.get('name')}  [{v.get('accent')}, {v.get('age')}, {v.get('use_case')}]")
+                paid = "" if v.get("free_users_allowed", True) else "  (paid plans only)"
+                print(f"\n{v.get('name')}  [{v.get('accent')}, {v.get('age')}, {v.get('use_case')}]{paid}")
                 print(f"  {str(v.get('description') or '').strip()[:160]}")
                 print(f"  preview: {v.get('preview_url')}")
-                print(f"  add with: python -m app.cli voices add {v.get('public_owner_id')} {v.get('voice_id')} \"{v.get('name')}\"")
+                print(f"  use it:  ELEVENLABS_VOICE_ID={v.get('voice_id')}  in backend/.env, then setup-agent")
             return 0
         if args.action == "add":
             response = client.post(

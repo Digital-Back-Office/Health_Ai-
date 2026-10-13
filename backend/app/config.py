@@ -211,3 +211,21 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def refresh_public_base_url(settings: Settings, env_file: str | Path | None) -> str | None:
+    """Re-read PUBLIC_BASE_URL from the .env file; returns the new value if it changed.
+
+    In development the tunnel URL changes when ngrok restarts and dev.ps1 writes the new one
+    to backend/.env, while Twilio callback URLs are built from this setting at runtime.
+    A PUBLIC_BASE_URL set in the real environment always wins.
+    """
+    if not env_file or "PUBLIC_BASE_URL" in os.environ:
+        return None
+    from dotenv import dotenv_values
+
+    value = (dotenv_values(env_file).get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if not value or value == settings.public_base_url:
+        return None
+    settings.public_base_url = value
+    return value
