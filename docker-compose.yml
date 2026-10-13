@@ -6,11 +6,12 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: healthcare
-      POSTGRES_PASSWORD: healthcare
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-healthcare}
       POSTGRES_DB: healthcare
       TZ: UTC
     ports:
-      - "5433:5432"
+      # Loopback only: local dev (dev.ps1 / pytest) can reach it, the internet can't.
+      - "127.0.0.1:5433:5432"
     volumes:
       # Postgres 18 images keep data under /var/lib/postgresql/<major>/docker.
       - pgdata:/var/lib/postgresql
@@ -20,6 +21,47 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # One-shot: applies Alembic migrations, then exits. The backend waits for it.
+  migrate:
+    build: ./backend
+    command: ["python", "-m", "app.cli", "migrate"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://healthcare:${POSTGRES_PASSWORD:-healthcare}@db:5432/healthcare
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build: ./backend
+    image: healthcare-ai-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://healthcare:${POSTGRES_PASSWORD:-healthcare}@db:5432/healthcare
+    ports:
+      - "127.0.0.1:8000:8000"   # host nginx proxies here
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"     # host nginx proxies here
+    depends_on:
+      - backend
 
 volumes:
   pgdata:
