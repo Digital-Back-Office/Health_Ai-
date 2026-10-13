@@ -241,7 +241,13 @@ async def _send(
             headers=headers,
             timeout=httpx.Timeout(settings.vertex_timeout_seconds, connect=5.0),
         )
-        response = await http.send(request, stream=stream)
+        try:
+            response = await http.send(request, stream=stream)
+        except httpx.TransportError as exc:  # timeouts, dropped connections
+            log.warning("Vertex request failed (attempt %d): %s", attempt + 1, type(exc).__name__)
+            if attempt < 1:
+                continue
+            raise HTTPException(status_code=504, detail="Vertex AI didn't answer in time") from exc
         if response.status_code == 200:
             return response
         body = (await response.aread()).decode("utf-8", "replace")

@@ -204,3 +204,11 @@ async def test_expired_google_login_gives_a_clear_error_and_recovers(client: htt
         )
         recovered = await client.post("/v1/chat/completions", json=body, headers=AUTH)
     assert recovered.status_code == 200
+
+
+async def test_vertex_timeout_is_retried_then_reported_cleanly(client: httpx.AsyncClient) -> None:
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False}
+    with respx.mock:
+        route = respx.post(VERTEX_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+        response = await client.post("/v1/chat/completions", json=body, headers=AUTH)
+    assert response.status_code == 504 and route.call_count == 2
