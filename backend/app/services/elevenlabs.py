@@ -65,6 +65,7 @@ class ElevenLabsClient:
                 f"{self._base_url}{path}", params=params, headers=self._headers, timeout=10.0
             )
         except httpx.HTTPError as exc:
+            log.warning("Could not reach ElevenLabs: %s", exc or type(exc).__name__)
             raise ElevenLabsError(f"Could not reach ElevenLabs: {exc}") from exc
         if response.status_code != 200:
             detail = response.text[:300]
@@ -107,6 +108,7 @@ class ElevenLabsClient:
                 f"{self._base_url}/v1/convai/twilio/outbound-call", json=body, headers=self._headers, timeout=20.0
             )
         except httpx.HTTPError as exc:
+            log.warning("Could not reach ElevenLabs: %s", exc or type(exc).__name__)
             raise ElevenLabsError(f"Could not reach ElevenLabs: {exc}") from exc
         if response.status_code != 200:
             raise ElevenLabsError(f"ElevenLabs returned {response.status_code}: {response.text[:300]}", response.status_code)
