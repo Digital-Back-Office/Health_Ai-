@@ -34,6 +34,12 @@
 - Book at least 6 to 8 weeks before you travel, because some vaccines need more than one dose.
 - Bring your travel itinerary and any previous vaccination records.
 
+## Dental consultation (30 minutes, £75)
+- A check-up and consultation with our dentist: examination of teeth and gums, advice and a treatment plan.
+- X-rays, hygiene appointments and any treatment are charged separately; the dentist will explain the costs before going ahead.
+- Bring a list of any medicines you take and details of previous dental treatment.
+- Dental emergencies (severe swelling, bleeding that won't stop, injury to the face or mouth): call 999 or go to A&E if it's severe, or NHS 111 for urgent dental help.
+
 ## What we don't offer
 - Emergency or urgent care: in an emergency call 999, and for urgent medical help call NHS 111.
 - NHS services or NHS registration.

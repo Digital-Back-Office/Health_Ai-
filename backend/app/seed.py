@@ -81,6 +81,16 @@ SERVICES: list[ServiceSeed] = [
         "Travel health advice and vaccinations before you go abroad. Vaccines are charged separately.",
         "Book at least 6 to 8 weeks before you travel, and bring your itinerary and vaccination record.",
     ),
+    ServiceSeed(
+        "dental_consultation",
+        "Dental consultation",
+        30,
+        7500,
+        "A check-up and consultation with our dentist: examination of teeth and gums, advice and a treatment plan. "
+        "X-rays and treatment are charged separately.",
+        "Please bring a list of any medicines you take and details of any previous dental treatment. "
+        "Brush your teeth beforehand if you can.",
+    ),
 ]
 
 WEEKDAYS = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
@@ -126,6 +136,13 @@ CLINICIANS: list[ClinicianSeed] = [
         "NMC-registered nurse for blood tests and travel vaccinations.",
         ("blood_test", "travel_consultation"),
         ((WEEKDAYS_MON_FRI, "08:00", "12:00"),),
+    ),
+    ClinicianSeed(
+        "Dr Priya Shah",
+        "Dentist",
+        "GDC-registered dentist offering check-ups, consultations and treatment planning.",
+        ("dental_consultation",),
+        ((("Mon", "Wed", "Fri"), "09:00", "13:00"), (("Mon", "Wed", "Fri"), "14:00", "17:30")),
     ),
 ]
 

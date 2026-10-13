@@ -144,3 +144,11 @@ def test_secret_creation_retries_elevenlabs_500s_with_a_neutral_name(monkeypatch
     assert ensure_secret(Api(), state, "hc_tool_secret", "value") == ("sec_1", None)
     assert len(names) == 3 and names[-1].startswith("healthai_")
     assert state["secrets"]["hc_tool_secret"]["id"] == "sec_1"
+
+
+async def test_dental_consultation_is_offered_by_the_dentist(db: AsyncSession) -> None:
+    clinic = await _snapshot(db)
+    dental = next(s for s in clinic.services if s.code == "dental_consultation")
+    assert dental.price_pence == 7500 and dental.duration_minutes == 30
+    assert [c.full_name for c in dental.clinicians] == ["Dr Priya Shah"]
+    assert "[dental_consultation]" in build_prompt(get_settings(), clinic)
