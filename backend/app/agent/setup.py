@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import time as dtime
@@ -347,6 +348,22 @@ def _system_tool(name: str) -> dict[str, Any]:
 # --- ElevenLabs resources ------------------------------------------------------------
 
 
+def _create_secret(api: ElevenLabsAdmin, key: str, value: str) -> dict[str, Any]:
+    """POST a workspace secret, retrying ElevenLabs 5xx errors.
+
+    Some accounts answer 500 for particular secret names, so later attempts use a neutral name.
+    """
+    names = [f"{key}_{int(time.time())}", f"{key}_{int(time.time())}", f"healthai_{uuid.uuid4().hex[:12]}"]
+    for attempt, name in enumerate(names):
+        try:
+            return api.call("POST", "/v1/convai/secrets", json={"type": "new", "name": name, "value": value})
+        except ApiError as exc:
+            if exc.status < 500 or attempt == len(names) - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
 def ensure_secret(api: ElevenLabsAdmin, state: dict[str, Any], key: str, value: str) -> tuple[str, str | None]:
     """Returns (secret_id, superseded_secret_id). Secrets are replaced, never edited in place."""
     secrets_state = state.setdefault("secrets", {})
@@ -355,9 +372,7 @@ def ensure_secret(api: ElevenLabsAdmin, state: dict[str, Any], key: str, value: 
         existing = api.call("GET", "/v1/convai/secrets").get("secrets", [])
         if any(s.get("secret_id") == entry["id"] for s in existing):
             return entry["id"], None
-    created = api.call(
-        "POST", "/v1/convai/secrets", json={"type": "new", "name": f"{key}_{int(time.time())}", "value": value}
-    )
+    created = _create_secret(api, key, value)
     secrets_state[key] = {"id": created["secret_id"], "fingerprint": fingerprint(value)}
     return created["secret_id"], entry["id"] if entry else None
 

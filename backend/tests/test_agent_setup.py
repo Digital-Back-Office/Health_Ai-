@@ -124,3 +124,23 @@ def test_voice_library_voice_is_added_and_a_bad_id_keeps_the_current_voice(monke
 
     monkeypatch.setattr(settings, "elevenlabs_voice_id", "typo-id")
     assert resolve_voice(api, settings, state, print) == "alice"
+
+
+def test_secret_creation_retries_elevenlabs_500s_with_a_neutral_name(monkeypatch) -> None:
+    from app.agent import setup
+    from app.agent.setup import ApiError, ensure_secret
+
+    monkeypatch.setattr(setup.time, "sleep", lambda s: None)
+    names: list[str] = []
+
+    class Api:
+        def call(self, method, path, *, json=None, params=None, allow_404=False):
+            names.append(json["name"])
+            if "tool_secret" in json["name"]:
+                raise ApiError(method, path, 500, '{"status": "internal_server_error"}')
+            return {"secret_id": "sec_1"}
+
+    state: dict = {}
+    assert ensure_secret(Api(), state, "hc_tool_secret", "value") == ("sec_1", None)
+    assert len(names) == 3 and names[-1].startswith("healthai_")
+    assert state["secrets"]["hc_tool_secret"]["id"] == "sec_1"
