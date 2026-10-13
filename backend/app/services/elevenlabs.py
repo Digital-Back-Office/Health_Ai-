@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,8 @@ from ..config import BACKEND_DIR, get_settings
 
 log = logging.getLogger(__name__)
 
-STATE_FILE = BACKEND_DIR / ".elevenlabs-state.json"
+# Written by setup-agent, read at runtime. Docker keeps it on a volume (ELEVENLABS_STATE_FILE=/data/...).
+STATE_FILE = Path(os.environ.get("ELEVENLABS_STATE_FILE") or BACKEND_DIR / ".elevenlabs-state.json")
 
 
 class ElevenLabsError(Exception):

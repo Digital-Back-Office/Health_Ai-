@@ -285,6 +285,25 @@ All of this is optional. Without the `TWILIO_*` settings the web app works as be
 * Optional data residency: `TWILIO_REGION=ie1` with `TWILIO_EDGE=dublin` (Twilio Regional, Ireland; it must be enabled on your account).
 * Costs: an SOS call rings every on-call doctor's mobile at once (UK mobile minutes each), plus the patient's leg.
 
+## Deploy (Docker)
+
+Production runs with Docker Compose behind the host's nginx (`deploy/nginx-health-ai.conf`, TLS via certbot). On the server:
+
+```bash
+cp .env.example .env            # then fill it in: PUBLIC_BASE_URL, secrets, ElevenLabs, Vertex, Twilio
+docker compose up -d --build    # database, migrations, backend (port 8000) and website (port 8080)
+docker compose run --rm backend python -m app.cli seed --no-demo-patients   # first deploy only
+docker compose run --rm backend python -m app.cli setup-agent               # first deploy, and after URL or voice changes
+docker compose run --rm backend python -m app.cli doctor                    # check what's configured
+```
+
+* Updating: `git pull` then `docker compose up -d --build` (migrations run automatically).
+* `setup-agent` keeps its state (agent, TwiML app, phone number) on the `agentstate` volume; don't delete it.
+* **Production gets its own agent.** On a fresh server `setup-agent` creates a new agent, and it moves the Twilio number to that agent. After that, take the `TWILIO_*` settings out of your laptop's `backend/.env` (or use a different number there). Otherwise `dev.cmd` moves the number back to your laptop the next time its ngrok address changes.
+* On a Google Cloud VM, leave `VERTEX_CREDENTIALS_FILE` empty: the VM's service account is used. Elsewhere, use a service-account key; a `gcloud` login expires.
+* Run one backend container. SOS timers, reminder calls and rate limits run inside the process.
+* Needs Docker Compose 2.24 or newer.
+
 ---
 
 ## The agent's tools

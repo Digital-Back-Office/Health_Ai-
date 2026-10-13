@@ -16,7 +16,9 @@ COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
 
-RUN useradd --system --uid 1001 --home /app appuser && chown appuser /app
+# /data holds the ElevenLabs agent state written by setup-agent (a volume in docker-compose.yml).
+RUN useradd --system --uid 1001 --home /app appuser && mkdir -p /data && chown appuser /app /data
+ENV ELEVENLABS_STATE_FILE=/data/elevenlabs-state.json
 USER appuser
 
 EXPOSE 8000
