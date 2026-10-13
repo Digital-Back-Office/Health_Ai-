@@ -87,7 +87,7 @@ class Settings(BaseSettings):
 
     # --- Vertex AI (custom LLM) ---------------------------------------------
     vertex_project_id: str | None = None
-    vertex_location: str = "europe-west2"
+    vertex_location: str = "global"
     vertex_model: str = "google/gemini-3.5-flash"
     # "minimal" keeps voice turns around a second; "low" adds roughly 2 s of thinking.
     vertex_reasoning_effort: str | None = "minimal"

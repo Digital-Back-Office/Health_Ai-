@@ -9,7 +9,7 @@
 Why a proxy rather than pointing ElevenLabs at Vertex directly: Vertex wants a
 Google OAuth access token that expires hourly, not a static API key. The proxy
 also keeps Gemini 3 "thought signatures" intact across tool-calling turns and
-pins the model/region (europe-west2 keeps inference in the UK).
+pins the model and region (VERTEX_MODEL / VERTEX_LOCATION).
 """
 
 from __future__ import annotations

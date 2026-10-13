@@ -5,7 +5,7 @@ A web-based AI receptionist for a UK private clinic. Patients talk (or type) to 
 | Part | Technology |
 |---|---|
 | Voice, speech-to-text, turn-taking | ElevenLabs Agents (British female voice, English only) |
-| LLM | Vertex AI Gemini (`europe-west2`, London) through an OpenAI-compatible proxy, used as ElevenLabs' *Custom LLM* |
+| LLM | Vertex AI Gemini 3.5 Flash (`global` endpoint) through an OpenAI-compatible proxy, used as ElevenLabs' *Custom LLM* |
 | Scheduling source of truth | PostgreSQL (double booking is prevented by an exclusion constraint) |
 | Staff diary mirror + staff busy blocks | Google Calendar (one calendar per clinician) |
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2 (async), Alembic |
@@ -52,7 +52,7 @@ Browser (React)                        Backend (FastAPI)                        
 3. GET /api/sessions/{id}/events  ◄──── live UI events (Postgres NOTIFY → SSE)          │
                                                                                       │ needs an answer
                                         POST /v1/chat/completions  ◄──────────────────┤ (Custom LLM)
-                                        └─► Vertex AI Gemini (OAuth, europe-west2)      │
+                                        └─► Vertex AI Gemini (OAuth, global)           │
                                                                                       │ calls a tool
                                         POST /tools/<name>  ◄─────────────────────────┘
                                           X-Tool-Secret: <workspace secret>
@@ -167,8 +167,8 @@ Tip: run `npm run build` in `frontend/` and the backend also serves the patient 
 2. Credentials, using either option:
    * **Your gcloud login (simplest for local development):** run `gcloud auth application-default login` with an account that has the Vertex AI User role, and leave `VERTEX_CREDENTIALS_FILE` **empty**. The quota project saved by gcloud is sent automatically. No key file is needed.
    * **A service account (for servers):** grant it **Vertex AI User**, download a JSON key to `backend/secrets/vertex-sa.json`, and set `VERTEX_CREDENTIALS_FILE` to that path. On Google Cloud (e.g. Cloud Run), leave it empty and the attached service account is used.
-3. Set `VERTEX_PROJECT_ID` (e.g. `dataflow-zone1`). `VERTEX_LOCATION=europe-west2` keeps inference in London.
-4. Keep `VERTEX_REASONING_EFFORT=minimal` for voice: replies start in about 1 s. `low` adds roughly 2 s per turn.
+3. Set `VERTEX_PROJECT_ID` (e.g. `dataflow-zone1`). `VERTEX_LOCATION=global` lets Google route each request to a region with capacity; `europe-west2` keeps inference in London but can return "too many requests" (HTTP 429) when that region is busy.
+4. Keep `VERTEX_REASONING_EFFORT=minimal` for voice: replies start in about 1 s. `low` adds roughly 2 s per turn (and some newer models, e.g. Gemini 3.8 Flash, don't accept `minimal`).
 5. Check it: `python -m app.cli check-vertex`. This tests a reply and a tool call and prints the latency. If the model isn't available in London, it suggests `VERTEX_LOCATION=global` or another `VERTEX_MODEL`. Gemini 3.5 Flash-Lite, for example, isn't offered in `europe-west2`.
 
 Why a proxy: Vertex accepts short-lived Google OAuth tokens (1 hour), not a static API key that ElevenLabs could store. The proxy refreshes tokens automatically, pins the model and region, and keeps Gemini 3 tool calling intact.
@@ -354,7 +354,7 @@ Frontend: `npm run typecheck` and `npm run build`.
 This is a prototype. **Use synthetic data only** until the following are in place:
 
 * **UK GDPR / DPA 2018:** health data is *special category* data, so you need an Article 9 condition (typically 9(2)(h)), a **DPIA**, ICO registration and an updated privacy notice.
-* **Processor agreements (DPAs)** with ElevenLabs, Google Cloud and your hosting provider. ElevenLabs stores data in the US by default; EU data residency and Zero Retention Mode are Enterprise features. Vertex AI inference stays in `europe-west2`.
+* **Processor agreements (DPAs)** with ElevenLabs, Google Cloud and your hosting provider. ElevenLabs stores data in the US by default; EU data residency and Zero Retention Mode are Enterprise features. With `VERTEX_LOCATION=global`, Google may run inference outside the UK; use a regional location if your DPIA requires UK processing.
 * **Keep the agent administrative.** It books and signposts, and never triages or advises. Once it starts influencing clinical decisions it may count as a medical device (MHRA).
 * **Retention:** the agent is set to 30-day retention with no voice recordings. Transcripts are not stored by the backend unless `STORE_TRANSCRIPTS=true`.
 * **Security:**
@@ -369,7 +369,7 @@ This is a prototype. **Use synthetic data only** until the following are in plac
 |---|---|
 | "The voice assistant isn't configured yet" | Set `ELEVENLABS_API_KEY` and run `python -m app.cli setup-agent`. |
 | Agent says the session expired on every tool | You're testing from the ElevenLabs dashboard; test via the web app. Or `PUBLIC_BASE_URL` is stale: restart the tunnel and re-run `setup-agent`. |
-| Agent replies slowly | Run `python -m app.cli check-vertex`. Keep `VERTEX_REASONING_EFFORT=minimal` and use a Flash model. In production, host the backend in London (e.g. Cloud Run `europe-west2`) next to Vertex. |
+| Agent replies slowly | Run `python -m app.cli check-vertex`. Use the lowest `VERTEX_REASONING_EFFORT` your model supports and a Flash model. In production, host the backend in London (e.g. Cloud Run `europe-west2`) next to Vertex. |
 | "All of our virtual receptionists are busy" | You've hit `MAX_CONCURRENT_SESSIONS` (your plan's concurrency). |
 | Calendar badge shows `failed` on the staff dashboard | Check sharing/permissions with `python -m app.cli check-calendar`; failed syncs retry automatically every minute. |
 | `setup-agent` reports HTTP 422 | The ElevenLabs API rejected a field. The full error is printed; the agent config lives in `app/agent/setup.py`. |
